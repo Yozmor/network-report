@@ -7,7 +7,7 @@ $maxHops = 30
 $pingTimeout = 500
 
 # =============== АВТООБНОВЛЕНИЕ ===============
-$updateRepoUrl = "https://raw.githubusercontent.com/твой-логин/network-report/main/NetworkReport.ps1"
+$updateRepoUrl = "https://raw.githubusercontent.com/Yozmor/network-report/refs/heads/main/network-report%203.0/NetworkReport.ps1"
 
 function Check-ForUpdates {
     Write-Host "`nПроверка обновлений..." -ForegroundColor Cyan
@@ -902,3 +902,4 @@ do {
         Read-Host | Out-Null
     }
 } while ($choice -ne "0")
+

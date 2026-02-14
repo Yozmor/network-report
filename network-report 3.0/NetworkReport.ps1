@@ -1,6 +1,6 @@
 # NetworkReport.ps1 - pure ASCII, no Unicode, no WHOIS, fast tracert
 # Версия скрипта – меняй вручную при каждом значимом обновлении
-$scriptVersion = "3.0"
+$scriptVersion = "3.1"
 
 
 $maxHops = 30
@@ -8,6 +8,32 @@ $pingTimeout = 500
 
 # =============== АВТООБНОВЛЕНИЕ ===============
 $updateRepoUrl = "https://raw.githubusercontent.com/Yozmor/network-report/refs/heads/main/network-report%203.0/NetworkReport.ps1"
+
+function Get-ScriptPath {
+    # Возвращает путь к текущему скрипту
+    if ($MyInvocation.MyCommand.Path) {
+        return $MyInvocation.MyCommand.Path
+    } elseif ($PSScriptRoot) {
+        # Если скрипт запущен как модуль или через точку, используем PSScriptRoot + имя файла
+        return Join-Path $PSScriptRoot "NetworkReport.ps1"
+    } else {
+        return $null
+    }
+}
+
+function Get-LocalVersion {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path $Path)) { return "0.0" }
+    $content = Get-Content $Path -Raw -ErrorAction SilentlyContinue
+    if (-not $content) { return "0.0" }
+    if ($content -match '#\s*VERSION\s*=\s*([\d\.]+)') {
+        return $matches[1]
+    }
+    if ($content -match '\$scriptVersion\s*=\s*"([\d\.]+)"') {
+        return $matches[1]
+    }
+    return "0.0"
+}
 
 function Check-ForUpdates {
     Write-Host "`nПроверка обновлений..." -ForegroundColor Cyan
@@ -22,7 +48,7 @@ function Check-ForUpdates {
         $remoteScript = Invoke-WebRequest -Uri $updateRepoUrl -TimeoutSec 5 -UseBasicParsing
         $remoteContent = $remoteScript.Content
 
-        # Ищем маркер версии: # VERSION= или $scriptVersion=
+        # Ищем маркер версии в remote
         $remoteVersion = $null
         $lines = $remoteContent -split "`n"
         foreach ($line in $lines) {
@@ -41,20 +67,9 @@ function Check-ForUpdates {
             return
         }
 
-        # Локальная версия (пытаемся считать из текущего скрипта)
-        $localVersion = $null
-        if (Test-Path $MyInvocation.MyCommand.Path) {
-            $localContent = Get-Content $MyInvocation.MyCommand.Path -Raw
-            if ($localContent -match '#\s*VERSION\s*=\s*([\d\.]+)') {
-                $localVersion = $matches[1]
-            } elseif ($localContent -match '\$scriptVersion\s*=\s*"([\d\.]+)"') {
-                $localVersion = $matches[1]
-            }
-        }
-
-        if (-not $localVersion) {
-            $localVersion = "0.0"
-        }
+        # Получаем локальную версию
+        $scriptPath = Get-ScriptPath
+        $localVersion = Get-LocalVersion -Path $scriptPath
 
         if ($remoteVersion -eq $localVersion) {
             Write-Host " У вас актуальная версия ($localVersion)." -ForegroundColor Green
@@ -73,10 +88,15 @@ function Check-ForUpdates {
 function Update-Script {
     param([string]$RemoteContent, [string]$RemoteVersion)
 
-    $scriptPath = $MyInvocation.MyCommand.Path
+    $scriptPath = Get-ScriptPath
+    if (-not $scriptPath) {
+        Write-Host " Не удалось определить путь к текущему скрипту." -ForegroundColor Red
+        return
+    }
 
     # Резервная копия
-    $backupFile = Join-Path $PSScriptRoot "NetworkReport_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').ps1"
+    $backupDir = Split-Path $scriptPath -Parent
+    $backupFile = Join-Path $backupDir "NetworkReport_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').ps1"
     try {
         Copy-Item -Path $scriptPath -Destination $backupFile -Force
         Write-Host " Резервная копия сохранена: $backupFile" -ForegroundColor Gray
@@ -223,11 +243,8 @@ function Get-ConnectionTypeDetailed {
 
 # =============== НАСТРОЙКИ DNS ===============
 $dnsCheckEnabled = $true  # Включить/отключить DNS-модуль
-$dnsTestDomain = "google.com"  # Домен для замера скорости
-$dnsSpoofDomain = "youtube.com"  # Домен для проверки честности
 $dnsTrustedServer = "8.8.8.8"  # Эталонный DNS
 $dnsTargets = @()  # Загрузится из файла
-$dnsTargetsFile = "dns_targets.txt"
 # ==============================================
 
 # =============== ЗАГРУЗКА СПИСКОВ ИЗ ФАЙЛОВ ===============
@@ -249,35 +266,67 @@ function Load-TextList {
     return $DefaultContent
 }
 
-# --- Загрузка целей для портов (формат: хост;порт;комментарий) ---
-function Load-PortTargets {
+# --- Загрузка целей для сканирования портов (формат: IP;комментарий) ---
+# --- Загрузка целей для сканирования портов (формат: IP;комментарий) ---
+function Load-ScanTargets {
     param($FileName)
     $path = Join-Path $scriptPath $FileName
-    $default = @()  # пустой массив — никаких целей по умолчанию
+    $default = @()
     if (-not (Test-Path $path)) {
         @"
-# Файл со списком целей для проверки портов
-# Формат: хост;порт;комментарий
-# Раскомментируй или добавь свои строки:
+# Файл со списком целей для сканирования портов
+# Формат: IP;комментарий
 
 "@ | Out-File $path -Encoding UTF8
-        Write-Host " Создан файл $FileName. Добавь в него свои цели и запусти скрипт снова." -ForegroundColor Yellow
+        Write-Host " Создан файл $FileName. Добавь свои цели и запусти скрипт снова." -ForegroundColor Yellow
         return $default
     }
     $result = @()
-    $lines = Get-Content $path -Encoding UTF8 | Where-Object { 
-        $_.Trim() -ne "" -and $_ -notmatch '^\s*#' 
+    $lines = Get-Content $path -Encoding UTF8 | Where-Object { $_.Trim() -ne "" -and $_ -notmatch '^\s*#' }
+    foreach ($line in $lines) {
+        $parts = $line.Split(';')
+        if ($parts.Count -ge 1) {
+            $ip = $parts[0].Trim()
+            $comment = if ($parts.Count -ge 2) { $parts[1].Trim() } else { "" }
+            $result += [PSCustomObject]@{
+                IP      = $ip
+                Comment = $comment
+            }
+        }
+    }
+    return $result
+}
+
+# --- Загрузка целей для трассировки (формат: IP;комментарий) ---
+function Load-TraceTargets {
+    param($FileName)
+    $path = Join-Path $scriptPath $FileName
+    $default = @()
+    if (-not (Test-Path $path)) {
+        @"
+# Файл со списком целей для трассировки
+# Формат: IP;комментарий
+
+"@ | Out-File $path -Encoding UTF8
+        Write-Host " Создан файл $FileName. Добавь свои цели и комментарии, затем запусти скрипт снова." -ForegroundColor Yellow
+        return $default
+    }
+    $result = @()
+    $lines = Get-Content $path -Encoding UTF8 | Where-Object {
+        $_.Trim() -ne "" -and $_ -notmatch '^\s*#'
     }
     foreach ($line in $lines) {
         $parts = $line.Split(';')
-        if ($parts.Count -ge 2) {
-            $hostname = $parts[0].Trim()
-            $port = [int]$parts[1].Trim()
-            $comment = if ($parts.Count -ge 3) { $parts[2].Trim() } else { "—" }
-            $result += @{Host = $hostname; Port = $port; Comment = $comment}
+        if ($parts.Count -ge 1) {
+            $ip = $parts[0].Trim()
+            $comment = if ($parts.Count -ge 2) { $parts[1].Trim() } else { "" }
+            $result += [PSCustomObject]@{
+                IP      = $ip
+                Comment = $comment
+            }
         }
     }
-    return $result  # если файл пустой или только комментарии — вернётся пустой массив
+    return $result
 }
 
 # --- Загрузка DNS-серверов (формат: хост;комментарий) ---
@@ -311,9 +360,9 @@ function Load-DnsTargets {
 }
 
 # --- ЗАГРУЖАЕМ ВСЕ СПИСКИ ---
-$sites         = Load-TextList -FileName "sites.txt"         -DefaultContent @("t.me", "discord.com", "youtube.com", "google.com")
-$traceTargets  = Load-TextList -FileName "trace_targets.txt" -DefaultContent @("t.me", "discord.com", "youtube.com", "google.com")
-$portTargets   = Load-PortTargets -FileName "port_targets.txt"
+$sites         = Load-TextList -FileName "sites.txt"        
+$traceTargets  = Load-TraceTargets -FileName "trace_targets.txt" 
+$scanTargets   = Load-ScanTargets -FileName "scan_targets.txt"
 $dnsTargets    = Load-DnsTargets  -FileName "dns_targets.txt"
 # ============================================================
 function Write-Log {
@@ -329,34 +378,262 @@ function Write-Log {
 }
 
 # --- ПРОВЕРКА ПОРТОВ (TCPING) ---
-function Test-Port {
-    param($Hostname, $Port)
+function Invoke-ServiceScan {
+    param(
+        [string]$LogFile,
+        [array]$Targets,
+        [int[]]$Ports = @(21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1723,3306,3389,5432,5900,6379,8080,8443,27017,27018),
+        [int]$TimeoutMs = 500,
+        [int]$BannerTimeoutMs = 2000
+    )
 
-    try {
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $connect = $tcp.BeginConnect($Hostname, $Port, $null, $null)
-        $wait = $connect.AsyncWaitHandle.WaitOne(1000, $false)  # таймаут 1 сек
-        if ($wait -and $tcp.Connected) {
-            $tcp.EndConnect($connect)
-            return "ОТКРЫТ"
-        } else {
-            return "ЗАКРЫТ/ФИЛЬТР"
-        }
-    } catch {
-        return "ОШИБКА"
-    } finally {
-        $tcp.Close()
+    Write-Log "`n--- СКАНИРОВАНИЕ СЕРВИСОВ (по баннерам) ---" -Color Green -LogFile $LogFile
+
+    if ($Targets.Count -eq 0) {
+        Write-Log " Нет целей для сканирования." -Color Red -LogFile $LogFile
+        return
     }
-}
 
-function Invoke-PortCheck {
-    param($LogFile)
-    Write-Log "`n--- ПРОВЕРКА ПОРТОВ ---" -Color Green -LogFile $LogFile
+    Write-Log "Целей: $($Targets.Count), портов: $($Ports.Count), таймаут: $TimeoutMs мс" -Color Cyan -LogFile $LogFile
 
-    foreach ($p in $portTargets) {
-        $status = Test-Port -Hostname $p.Host -Port $p.Port
-        $color = if ($status -eq "ОТКРЫТ") { "Green" } else { "Red" }
-        Write-Log "[$status] $($p.Host):$($p.Port) — $($p.Comment)" -Color $color -LogFile $LogFile
+    # --- Словарь популярных сервисов по портам ---
+    $wellKnown = @{
+        21   = "FTP"
+        22   = "SSH"
+        23   = "Telnet"
+        25   = "SMTP"
+        53   = "DNS"
+        80   = "HTTP"
+        110  = "POP3"
+        111  = "RPC"
+        135  = "RPC"
+        139  = "NetBIOS"
+        143  = "IMAP"
+        443  = "HTTPS"
+        445  = "SMB"
+        993  = "IMAPS"
+        995  = "POP3S"
+        1723 = "PPTP"
+        3306 = "MySQL"
+        3389 = "RDP"
+        5432 = "PostgreSQL"
+        5900 = "VNC"
+        6379 = "Redis"
+        8080 = "HTTP-Alt"
+        8443 = "HTTPS-Alt"
+        27017= "MongoDB"
+        27018= "MongoDB"
+    }
+
+    # --- Локальная база уязвимостей ---
+    $vulnDB = @{
+        "OpenSSH" = @(
+            @{ VersionPattern = "8\.[0-5]"; CVE = "CVE-2021-28041"; Description = "Double-free vulnerability" }
+            @{ VersionPattern = "8\.[0-2]"; CVE = "CVE-2020-15778"; Description = "Command injection in scp" }
+            @{ VersionPattern = "7\.[0-9]"; CVE = "CVE-2016-6210"; Description = "User enumeration" }
+        )
+        "Apache" = @(
+            @{ VersionPattern = "2\.4\.49"; CVE = "CVE-2021-41773"; Description = "Path traversal" }
+            @{ VersionPattern = "2\.4\.50"; CVE = "CVE-2021-42013"; Description = "Path traversal (bypass)" }
+            @{ VersionPattern = "2\.4\.48"; CVE = "CVE-2021-34798"; Description = "NULL pointer dereference" }
+        )
+        "nginx" = @(
+            @{ VersionPattern = "1\.20\.[0-1]"; CVE = "CVE-2021-23017"; Description = "DNS resolver memory leak" }
+            @{ VersionPattern = "1\.18\.[0-9]"; CVE = "CVE-2020-11724"; Description = "Request smuggling" }
+        )
+        "ProFTPD" = @(
+            @{ VersionPattern = "1\.3\.5"; CVE = "CVE-2015-3306"; Description = "File copy vulnerability" }
+        )
+        "MySQL" = @(
+            @{ VersionPattern = "5\.7\.[0-9]"; CVE = "CVE-2020-2760"; Description = "Privilege escalation" }
+            @{ VersionPattern = "8\.0\.[0-9]"; CVE = "CVE-2020-14586"; Description = "Buffer overflow" }
+        )
+        "PostgreSQL" = @(
+            @{ VersionPattern = "9\.[0-6]"; CVE = "CVE-2019-10208"; Description = "Bypass authentication" }
+        )
+        "vsftpd" = @(
+            @{ VersionPattern = "2\.3\.[2-4]"; CVE = "CVE-2011-0762"; Description = "Backdoor command execution" }
+        )
+    }
+
+    # --- Функция проверки уязвимостей ---
+    function Test-Vulnerabilities {
+        param($Service, $Version)
+        $found = @()
+        if ($vulnDB.ContainsKey($Service)) {
+            foreach ($entry in $vulnDB[$Service]) {
+                if ($Version -match $entry.VersionPattern) {
+                    $found += $entry
+                }
+            }
+        }
+        return $found
+    }
+
+    # --- Функция получения баннера и парсинга ---
+    function Get-BannerInfo {
+        param($hostIP, $port, $timeout)
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $banner = $null
+        try {
+            $connect = $tcp.BeginConnect($hostIP, $port, $null, $null)
+            $wait = $connect.AsyncWaitHandle.WaitOne($timeout, $false)
+            if ($wait -and $tcp.Connected) {
+                $tcp.EndConnect($connect)
+                $stream = $tcp.GetStream()
+                $stream.ReadTimeout = $timeout
+
+                if ($port -eq 80 -or $port -eq 8080) {
+                    $request = [System.Text.Encoding]::ASCII.GetBytes("HEAD / HTTP/1.0`r`n`r`n")
+                    $stream.Write($request, 0, $request.Length)
+                } elseif ($port -eq 443 -or $port -eq 8443) {
+                    # HTTPS пропускаем (можно добавить SslStream, но сложно)
+                }
+
+                $buffer = New-Object byte[] 1024
+                $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
+                if ($bytesRead -gt 0) {
+                    $banner = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $bytesRead).Trim()
+                }
+                $stream.Close()
+            }
+        } catch {
+            # ошибка чтения баннера
+        } finally {
+            $tcp.Close()
+        }
+
+        # Парсинг баннера
+        $service = $wellKnown[$port]
+        $version = $null
+        $os = $null
+
+        if ($banner) {
+            if ($banner -match '(Apache|nginx|Microsoft-IIS|lighttpd)[/ ]?([\d\.]+)') {
+                $service = $matches[1]
+                $version = $matches[2]
+                if ($banner -match '\(Ubuntu\)') { $os = "Ubuntu" }
+                elseif ($banner -match '\(Debian\)') { $os = "Debian" }
+                elseif ($banner -match '\(CentOS\)') { $os = "CentOS" }
+                elseif ($banner -match 'Win') { $os = "Windows" }
+            } elseif ($banner -match 'OpenSSH[_ ]?([\d\.]+)') {
+                $version = $matches[1]
+                if ($banner -match 'Ubuntu') { $os = "Ubuntu" }
+                elseif ($banner -match 'Debian') { $os = "Debian" }
+            } elseif ($banner -match 'ProFTPD ([\d\.]+)') {
+                $service = "ProFTPD"
+                $version = $matches[1]
+            } elseif ($banner -match 'MySQL') {
+                $service = "MySQL"
+                if ($banner -match '([\d\.]+)-') { $version = $matches[1] }
+            } elseif ($banner -match 'PostgreSQL') {
+                $service = "PostgreSQL"
+                if ($banner -match '([\d\.]+)') { $version = $matches[1] }
+            } elseif ($banner -match 'ESMTP') {
+                $service = "ESMTP"
+            }
+        }
+        return [PSCustomObject]@{
+            Port    = $port
+            Open    = $true
+            Service = $service
+            Version = $version
+            OS      = $os
+            Banner  = $banner
+        }
+    }
+
+    foreach ($target in $Targets) {
+        Write-Log "`n Сканирование $($target.IP) [$($target.Comment)]" -Color Magenta -LogFile $LogFile
+        Write-Log " Используется последовательное сканирование. Рекомендуется PowerShell 7." -Color Yellow -LogFile $LogFile
+
+        $results = @()  # соберём все результаты
+
+        # Сканируем все порты и собираем информацию
+        foreach ($port in $Ports) {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $open = $false
+            try {
+                $connect = $tcp.BeginConnect($target.IP, $port, $null, $null)
+                $wait = $connect.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+                if ($wait -and $tcp.Connected) {
+                    $tcp.EndConnect($connect)
+                    $open = $true
+                }
+            } catch {
+                # порт закрыт
+            } finally {
+                $tcp.Close()
+            }
+
+            if ($open) {
+                $info = Get-BannerInfo -hostIP $target.IP -port $port -timeout $BannerTimeoutMs
+                $results += $info
+            } else {
+                $results += [PSCustomObject]@{
+                    Port    = $port
+                    Open    = $false
+                    Service = $null
+                    Version = $null
+                    OS      = $null
+                    Banner  = $null
+                }
+            }
+        }
+
+        # Определяем общую информацию (ОС)
+        $osDetected = $null
+        foreach ($r in $results | Where-Object { $_.Open }) {
+            if ($r.OS) { $osDetected = $r.OS; break }
+        }
+
+        # Выводим общую информацию
+        if ($osDetected) {
+            Write-Log "   Операционная система: $osDetected" -Color Cyan -LogFile $LogFile
+        }
+
+        $openCount = ($results | Where-Object { $_.Open }).Count
+        Write-Log "   Открыто портов: $openCount" -Color Green -LogFile $LogFile
+
+        # Выводим каждый порт в одну строку
+        $openPortsInfo = @()
+        foreach ($r in $results | Sort-Object Port) {
+            if ($r.Open) {
+                $serviceName = if ($r.Service) { $r.Service } else { $wellKnown[$r.Port] }
+                Write-Log "  $($r.Port)/tcp – $serviceName – ОТКРЫТ" -Color Green -LogFile $LogFile
+                $openPortsInfo += $r
+            } else {
+                Write-Log "  $($r.Port)/tcp – ЗАКРЫТ" -Color Red -LogFile $LogFile
+            }
+        }
+
+        # --- Проверка уязвимостей для открытых портов ---
+        $vulnsFound = @()
+        foreach ($r in $openPortsInfo) {
+            if ($r.Version) {
+                $vulns = Test-Vulnerabilities -Service $r.Service -Version $r.Version
+                if ($vulns) {
+                    $vulnsFound += [PSCustomObject]@{
+                        Port    = $r.Port
+                        Service = $r.Service
+                        Version = $r.Version
+                        Vulns   = $vulns
+                    }
+                }
+            }
+        }
+
+        if ($vulnsFound.Count -gt 0) {
+            Write-Log "`n   --- НАЙДЕННЫЕ УЯЗВИМОСТИ ---" -Color Red -LogFile $LogFile
+            foreach ($item in $vulnsFound) {
+                Write-Log "   $($item.Service) v$($item.Version) (порт $($item.Port)):" -Color Yellow -LogFile $LogFile
+                foreach ($v in $item.Vulns) {
+                    Write-Log "     - $($v.CVE): $($v.Description)" -Color Gray -LogFile $LogFile
+                }
+            }
+        } else {
+            Write-Log "`n    Уязвимостей не найдено." -Color Green -LogFile $LogFile
+        }
     }
 }
 
@@ -581,15 +858,29 @@ function Invoke-WebAndDnsDiagnostics {
 
 # --- ТРАССИРОВКА ---
 function Analyze-Trace {
-    param($Target, $LogFile)
+    param(
+        $TargetInfo,   # объект с полями IP и Comment
+        $LogFile
+    )
 
-    Write-Log "`nТрассировка до $Target ..." -Color Magenta -LogFile $LogFile
+    $target = $TargetInfo.IP
+    $comment = $TargetInfo.Comment
+    if ($comment) { $displayTarget = "$target ($comment)" } else { $displayTarget = $target }
+
+    # Свой заголовок (выводится в меню, но если нужно, можно оставить здесь, но у нас он уже есть в меню)
+    # Write-Log "`nТрассировка до $displayTarget ..." -Color Magenta -LogFile $LogFile
 
     try {
-        $traceOutput = tracert -h $maxHops -w $pingTimeout $Target 2>&1
+        $traceOutput = tracert -d -h $maxHops -w $pingTimeout $target 2>&1
         $lines = $traceOutput -split "`n"
 
-        # ---- Извлекаем целевой IP из заголовка ----
+        # Пропускаем первую строку заголовка, если она содержит "Трассировка маршрута"
+        $startIndex = 0
+        if ($lines.Count -gt 0 -and $lines[0] -match 'Трассировка маршрута') {
+            $startIndex = 1
+        }
+
+        # Извлекаем целевой IP из заголовка (все равно нужно)
         $targetIP = $null
         foreach ($line in $lines) {
             if ($line -match '\[(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\]') {
@@ -597,34 +888,35 @@ function Analyze-Trace {
                 break
             }
         }
-        # Если не нашли в заголовке, может Target сам IP
-        if (-not $targetIP -and ($Target -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')) {
-            $targetIP = $Target
+        if (-not $targetIP -and ($target -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')) {
+            $targetIP = $target
         }
 
         $hops = @()
         $lastRespondingHop = $null
         $lastRespondingIP = $null
+        $pingCache = @{}
 
-        foreach ($line in $lines) {
-            # ---- Строка с IP-адресом ----
+        # Выводим строки начиная с индекса $startIndex
+        for ($i = $startIndex; $i -lt $lines.Count; $i++) {
+            $line = $lines[$i]
+
+            # Строка с IP-адресом
             if ($line -match '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})') {
                 $ip = $matches[1]
-
-                # Номер хопа (первое число в строке)
-                $hopNumber = 0
-                if ($line -match '^\s*(\d+)') {
-                    $hopNumber = [int]$matches[1]
-                }
-
-                # Был ли ответ (цифра перед ms/мс)
+                $hopNumber = if ($line -match '^\s*(\d+)') { [int]$matches[1] } else { 0 }
                 $hasResponse = $line -match '\d+\s*ms' -or $line -match '\d+\s*мс'
+
+                # Если хоп 0 (заголовок) – не обрабатываем
+                if ($hopNumber -eq 0) {
+                    # Но если мы уже пропустили первую строку, сюда не попадем
+                    continue
+                }
 
                 $hops += [PSCustomObject]@{
                     Number      = $hopNumber
                     IP          = $ip
                     HasResponse = $hasResponse
-                    Raw         = $line
                 }
 
                 if ($hasResponse) {
@@ -632,19 +924,51 @@ function Analyze-Trace {
                     $lastRespondingIP = $ip
                 }
 
-                Write-Log $line -Color Gray -LogFile $LogFile
+                # Формируем строку вывода с информацией о потерях
+                $outLine = $line
+
+                if ($ip -notmatch '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|127\.)') {
+                    if (-not $pingCache.ContainsKey($ip)) {
+                        $pingResult = Test-Connection -ComputerName $ip -Count 3 -ErrorAction SilentlyContinue
+                        if ($pingResult) {
+                            $received = ($pingResult | Where-Object { $_.StatusCode -eq 0 }).Count
+                            $lost = 3 - $received
+                            $lossPercent = ($lost / 3) * 100
+                            if ($received -gt 0) {
+                                $avg = [math]::Round(($pingResult | Measure-Object ResponseTime -Average).Average, 0)
+                                $min = ($pingResult | Measure-Object ResponseTime -Minimum).Minimum
+                                $max = ($pingResult | Measure-Object ResponseTime -Maximum).Maximum
+                                $pingCache[$ip] = " [loss $lossPercent% $avg ms]"
+                            } else {
+                                $pingCache[$ip] = " [loss 100% no reply]"
                             }
-            # ---- Строка с тремя звёздочками ----
-            elseif ($line -match '^\s*\d+\s+\*\s+\*\s+\*') {
-                Write-Log $line -Color Red
+                        } else {
+                            $pingCache[$ip] = " [ping failed]"
+                        }
+                    }
+                    $outLine += $pingCache[$ip]
+                } else {
+                    $outLine += " [local]"
+                }
+
+                $lineColor = if ($hasResponse) { "Gray" } else { "Red" }
+                Write-Log $outLine -Color $lineColor -LogFile $LogFile
             }
-            # ---- Остальные строки ----
+            # Строка с тремя звёздочками (потеря пакетов на хопе)
+            elseif ($line -match '^\s*\d+\s+\*\s+\*\s+\*') {
+                Write-Log $line -Color Red -LogFile $LogFile
+            }
+            # Строка "Трассировка завершена."
+            elseif ($line -match 'Трассировка завершена') {
+                Write-Log $line -Color Gray -LogFile $LogFile
+            }
+            # Все остальные строки (например, сообщения об ошибках) выводим серым
             else {
                 Write-Log $line -Color Gray -LogFile $LogFile
             }
         }
 
-        # ---- Анализ ----
+        # Анализ достижения цели (оставляем как есть)
         if ($hops.Count -eq 0) {
             Write-Log "    Не найдено ни одного IP-адреса." -Color Yellow -LogFile $LogFile
             return
@@ -654,26 +978,23 @@ function Analyze-Trace {
 
         if ($targetIP) {
             if ($lastHop.IP -eq $targetIP) {
-                # Цель достигнута
                 if ($lastHop.HasResponse) {
-                    Write-Log "    Цель достигнута, ответ получен." -Color Green -LogFile $LogFile
+                    Write-Log "     Цель достигнута, ответ получен. $comment" -Color Green -LogFile $LogFile
                 } else {
-                    Write-Log "    Цель достигнута, но не отвечает на ping." -Color Yellow -LogFile $LogFile
+                    Write-Log "     Цель достигнута, но не отвечает на ping. $comment" -Color Yellow -LogFile $LogFile
                 }
                 Write-Log "   Целевой IP: $targetIP" -Color Gray -LogFile $LogFile
             } else {
-                # Цель не достигнута — обрыв
-                Write-Log "    Цель НЕ ДОСТИГНУТА. Возможная блокировка." -Color Red -LogFile $LogFile
+                Write-Log "     Цель НЕ ДОСТИГНУТА. Возможная блокировка." -Color Red -LogFile $LogFile
                 if ($lastRespondingIP) {
                     Write-Log "       Последний отвечающий узел: $lastRespondingIP (хоп $lastRespondingHop)" -Color Red -LogFile $LogFile
-                                    } else {
+                } else {
                     Write-Log "       Нет отвечающих узлов." -Color Red -LogFile $LogFile
                 }
                 Write-Log "   Целевой IP: $targetIP" -Color Gray -LogFile $LogFile
             }
         } else {
-            # Не удалось определить целевой IP — используем старую логику
-            Write-Log "    Не удалось определить целевой IP." -Color Yellow -LogFile $LogFile
+            Write-Log "     Не удалось определить целевой IP." -Color Yellow -LogFile $LogFile
             if ($lastHop.HasResponse) {
                 Write-Log "    Последний узел: $($lastHop.IP) (ответ получен)" -Color Green -LogFile $LogFile
             } else {
@@ -685,6 +1006,8 @@ function Analyze-Trace {
         Write-Log "Ошибка трассировки: $($_.Exception.Message)" -Color Red -LogFile $LogFile
     }
 }
+
+
 
 # ---СТАРТОВЫЙ ЗАГОЛОВОК---
 function Start-Report {
@@ -717,13 +1040,14 @@ function Start-Report {
     return $logFile
 }
 
+
 # =============== МЕНЮ ===============
 function Show-Menu {
     Write-Host "`n========== МЕНЮ ==========" -ForegroundColor Cyan
     Write-Host "1 - Проверить сайты (только HTTP)" -ForegroundColor Yellow
     Write-Host "2 - Трассировка (из списка)" -ForegroundColor Yellow
     Write-Host "3 - Трассировка (свой хост)" -ForegroundColor Yellow
-    Write-Host "4 - Проверить порты" -ForegroundColor Yellow
+    Write-Host "4 - Сканирование серверов" -ForegroundColor Yellow
     Write-Host "5 - Полная диагностика (HTTP + DNS)" -ForegroundColor Yellow
     Write-Host "6 - Всё вместе (трассировка + порты + диагностика)" -ForegroundColor Yellow
     Write-Host "7 - Инструкция" -ForegroundColor Yellow
@@ -745,20 +1069,23 @@ do {
 	    $logFile = Start-Report -FolderKey "trace"
             Write-Log "`n--- ТРАССИРОВКА (макс. $maxHops хопов, таймаут ${pingTimeout}мс) ---" -Color Green -LogFile $logFile
             foreach ($target in $traceTargets) {
-                Analyze-Trace -Target $target -LogFile $logFile
+                Analyze-Trace -TargetInfo $target -LogFile $logFile
             }
         }
         "3" {
-	    $logFile = Start-Report -FolderKey "trace"
             $custom = Read-Host "Введите IP или домен"
-            if ($custom) {
-                Write-Log "`n--- ТРАССИРОВКА (макс. $maxHops хопов, таймаут ${pingTimeout}мс) ---" -Color Green -LogFile $logFile
-                Analyze-Trace -Target $custom -LogFile $logFile
+    if ($custom) {
+        $logFile = Start-Report -FolderKey "trace"
+        Write-Log "`n--- ТРАССИРОВКА (макс. $maxHops хопов, таймаут ${pingTimeout}мс) ---" -Color Green -LogFile $logFile
+        # Создаём объект с пустым комментарием
+        $targetObj = [PSCustomObject]@{ IP = $custom; Comment = "" }
+        Analyze-Trace -TargetInfo $targetObj -LogFile $logFile
             }
         }
+        
         "4" {
-	    $logFile = Start-Report -FolderKey "ports"
-            Invoke-PortCheck -LogFile $logFile
+	    $logFile = Start-Report -FolderKey "service_scan"
+        Invoke-ServiceScan -LogFile $logFile -Targets $scanTargets
         }
         "5" {
 	    $logFile = Start-Report -FolderKey "dns_full"
@@ -774,10 +1101,10 @@ do {
             Write-Log "" -LogFile $logFile
             Write-Log "`n--- ТРАССИРОВКА (макс. $maxHops хопов, таймаут ${pingTimeout}мс) ---" -Color Green -LogFile $logFile
             foreach ($target in $traceTargets) {
-                Analyze-Trace -Target $target -LogFile $logFile
+                Analyze-Trace -TargetInfo $target -LogFile $logFile
             }
             Write-Log "" -LogFile $logFile
-            Invoke-PortCheck -LogFile $logFile
+            Invoke-ServiceScan -LogFile $logFile -Targets $scanTargets
             Write-Log "" -LogFile $logFile
             if ($dnsCheckEnabled) {
                 Invoke-WebAndDnsDiagnostics -LogFile $logFile
@@ -902,4 +1229,3 @@ do {
         Read-Host | Out-Null
     }
 } while ($choice -ne "0")
-

@@ -7,7 +7,7 @@ $maxHops = 30
 $pingTimeout = 500
 
 # =============== АВТООБНОВЛЕНИЕ ===============
-$updateRepoUrl = "https://raw.githubusercontent.com/Yozmor/network-report/refs/heads/main/network-report%203.1/NetworkReport.ps1"
+$updateRepoUrl = "https://raw.githubusercontent.com/Yozmor/network-report/refs/heads/main/network-report/NetworkReport.ps1"
 
 function Get-ScriptPath {
     # Возвращает путь к текущему скрипту

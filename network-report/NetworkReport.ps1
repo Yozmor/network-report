@@ -1,4 +1,4 @@
-﻿# NetworkReport.ps1 - pure ASCII, no Unicode, no WHOIS, fast tracert
+# NetworkReport.ps1 - pure ASCII, no Unicode, no WHOIS, fast tracert
 # Версия скрипта – меняй вручную при каждом значимом обновлении
 $scriptVersion = "3.2"
 
@@ -83,6 +83,36 @@ function Check-ForUpdates {
     } catch {
         Write-Host " Ошибка при проверке обновлений: $_" -ForegroundColor Red
     }
+}
+function Check-Version {
+    try {
+        # Скачиваем raw-файл
+        $remoteScript = Invoke-WebRequest -Uri $updateRepoUrl -TimeoutSec 5 -UseBasicParsing
+        $remoteContent = $remoteScript.Content
+        # Ищем маркер версии в remote
+        $remoteVersion = $null
+        $lines = $remoteContent -split "`n"
+        foreach ($line in $lines) {
+            if ($line -match '#\s*VERSION\s*=\s*([\d\.]+)') {
+                $remoteVersion = $matches[1]
+                break
+            }
+            if ($line -match '\$scriptVersion\s*=\s*"([\d\.]+)"') {
+                $remoteVersion = $matches[1]
+                break
+            }
+        }
+        # Получаем локальную версию
+        $scriptPath = Get-ScriptPath
+        $localVersion = Get-LocalVersion -Path $scriptPath
+
+        if ($remoteVersion -ne $localVersion) {
+            Write-Host " Доступна новая версия: $remoteVersion (текущая: $localVersion)." -ForegroundColor Yellow
+            }
+        }
+            catch {
+                Write-Host ""
+                }
 }
 
 function Update-Script {
@@ -1043,7 +1073,6 @@ function Start-Report {
 
 # =============== МЕНЮ ===============
 function Show-Menu {
-    Write-Host "`nVersion $scriptVersion" -ForegroundColor Gray
     Write-Host "`n========== МЕНЮ ==========" -ForegroundColor Cyan
     Write-Host "1 - Проверить сайты (только HTTP)" -ForegroundColor Yellow
     Write-Host "2 - Полная диагностика (HTTP + DNS)" -ForegroundColor Yellow
@@ -1058,6 +1087,8 @@ function Show-Menu {
 }
 
 do {
+    Write-Host "`nVersion $scriptVersion" -ForegroundColor Gray
+    Check-Version
     Show-Menu
     $choice = Read-Host "Выберите действие"
 

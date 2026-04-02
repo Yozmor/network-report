@@ -1,6 +1,6 @@
 # NetworkReport.ps1 - pure ASCII, no Unicode, no WHOIS, fast tracert
 # Версия скрипта – меняй вручную при каждом значимом обновлении
-$scriptVersion = "3.3"
+$scriptVersion = "3.2"
 
 
 $maxHops = 30

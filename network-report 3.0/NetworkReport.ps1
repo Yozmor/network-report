@@ -1,6 +1,6 @@
 # NetworkReport.ps1 - pure ASCII, no Unicode, no WHOIS, fast tracert
 # Версия скрипта – меняй вручную при каждом значимом обновлении
-$scriptVersion = "3.0"
+$scriptVersion = "3.1"
 
 
 $maxHops = 30
@@ -868,7 +868,7 @@ function Analyze-Trace {
     if ($comment) { $displayTarget = "$target ($comment)" } else { $displayTarget = $target }
 
     # Свой заголовок (выводится в меню, но если нужно, можно оставить здесь, но у нас он уже есть в меню)
-    # Write-Log "`nТрассировка до $displayTarget ..." -Color Magenta -LogFile $LogFile
+    Write-Log "`nТрассировка до $displayTarget ..." -Color Magenta -LogFile $LogFile
 
     try {
         $traceOutput = tracert -d -h $maxHops -w $pingTimeout $target 2>&1
@@ -1045,10 +1045,10 @@ function Start-Report {
 function Show-Menu {
     Write-Host "`n========== МЕНЮ ==========" -ForegroundColor Cyan
     Write-Host "1 - Проверить сайты (только HTTP)" -ForegroundColor Yellow
-    Write-Host "2 - Трассировка (из списка)" -ForegroundColor Yellow
-    Write-Host "3 - Трассировка (свой хост)" -ForegroundColor Yellow
-    Write-Host "4 - Сканирование серверов" -ForegroundColor Yellow
-    Write-Host "5 - Полная диагностика (HTTP + DNS)" -ForegroundColor Yellow
+    Write-Host "2 - Полная диагностика (HTTP + DNS)" -ForegroundColor Yellow
+    Write-Host "3 - Трассировка (из списка)" -ForegroundColor Yellow
+    Write-Host "4 - Трассировка (свой хост)" -ForegroundColor Yellow
+    Write-Host "5 - Сканирование серверов" -ForegroundColor Yellow
     Write-Host "6 - Всё вместе (трассировка + порты + диагностика)" -ForegroundColor Yellow
     Write-Host "7 - Инструкция" -ForegroundColor Yellow
     Write-Host "8 - Проверить обновления" -ForegroundColor Yellow
@@ -1064,15 +1064,23 @@ do {
         "1" {
 	    $logFile = Start-Report -FolderKey "http"
             Invoke-WebCheck -LogFile $logFile
-        }
+        }        
         "2" {
+	    $logFile = Start-Report -FolderKey "dns_full"
+            if ($dnsCheckEnabled) {
+                Invoke-WebAndDnsDiagnostics -LogFile $logFile
+            } else {
+                Write-Log "DNS-проверка отключена в настройках." -Color Red -LogFile $logFile
+            }
+        }
+        "3" {
 	    $logFile = Start-Report -FolderKey "trace"
             Write-Log "`n--- ТРАССИРОВКА (макс. $maxHops хопов, таймаут ${pingTimeout}мс) ---" -Color Green -LogFile $logFile
             foreach ($target in $traceTargets) {
                 Analyze-Trace -TargetInfo $target -LogFile $logFile
             }
         }
-        "3" {
+        "4" {
             $custom = Read-Host "Введите IP или домен"
     if ($custom) {
         $logFile = Start-Report -FolderKey "trace"
@@ -1083,17 +1091,9 @@ do {
             }
         }
         
-        "4" {
+        "5" {
 	    $logFile = Start-Report -FolderKey "service_scan"
         Invoke-ServiceScan -LogFile $logFile -Targets $scanTargets
-        }
-        "5" {
-	    $logFile = Start-Report -FolderKey "dns_full"
-            if ($dnsCheckEnabled) {
-                Invoke-WebAndDnsDiagnostics -LogFile $logFile
-            } else {
-                Write-Log "DNS-проверка отключена в настройках." -Color Red -LogFile $logFile
-            }
         }
         "6" {
 	    $logFile = Start-Report -FolderKey "all"
@@ -1217,7 +1217,7 @@ do {
         }
     }
 
-        if ($choice -ne "0" -and $choice -ne "7") {
+        if ($choice -ne "0" -and $choice -ne "7" -and $choice -ne "8") {
         Write-Log "`n========================================================" -Color Cyan -LogFile $logFile
         Write-Log "Отчёт сохранён в файл:" -Color Cyan -LogFile $logFile
         Write-Log "   $logFile" -Color Yellow -LogFile $logFile

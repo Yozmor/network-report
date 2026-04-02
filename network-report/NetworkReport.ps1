@@ -1100,6 +1100,11 @@ do {
 	    $logFile = Start-Report -FolderKey "all"
             Invoke-WebCheck -LogFile $logFile
             Write-Log "" -LogFile $logFile
+                        if ($dnsCheckEnabled) {
+                Invoke-WebAndDnsDiagnostics -LogFile $logFile
+            } else {
+                Write-Log "DNS-проверка отключена в настройках." -Color Yellow -LogFile $logFile
+            }
             Write-Log "`n--- ТРАССИРОВКА (макс. $maxHops хопов, таймаут ${pingTimeout}мс) ---" -Color Green -LogFile $logFile
             foreach ($target in $traceTargets) {
                 Analyze-Trace -TargetInfo $target -LogFile $logFile
@@ -1107,11 +1112,6 @@ do {
             Write-Log "" -LogFile $logFile
             Invoke-ServiceScan -LogFile $logFile -Targets $scanTargets
             Write-Log "" -LogFile $logFile
-            if ($dnsCheckEnabled) {
-                Invoke-WebAndDnsDiagnostics -LogFile $logFile
-            } else {
-                Write-Log "DNS-проверка отключена в настройках." -Color Yellow -LogFile $logFile
-            }
         }
     "7" {
     Write-Host ""

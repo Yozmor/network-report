@@ -1,6 +1,6 @@
 # NetworkReport.ps1 - pure ASCII, no Unicode, no WHOIS, fast tracert
 # Версия скрипта – меняй вручную при каждом значимом обновлении
-$scriptVersion = "3.4"
+$scriptVersion = "3.5"
 
 
 $maxHops = 30
@@ -200,7 +200,7 @@ function Get-ConnectionTypeDetailed {
     # --- Способ 1: стандартные VPN Windows ---
     try {
         $vpnConnections = Get-VpnConnection -ErrorAction SilentlyContinue
-        $activeVpn = $vpnConnections | Where-Object { $_.ConnectionStatus -eq "Connected" } | Select-Object -First 1
+        $activeVpn = $vpnConnections | Where-Object { $_.ConnectionStatus -eq "Connected" } 
         if ($activeVpn) {
             $result.VpnName = $activeVpn.Name -replace '[\\/:*?"<>|]', '_'
             $result.VpnActive = $true
@@ -208,12 +208,12 @@ function Get-ConnectionTypeDetailed {
     } catch { }
 
     # --- Способ 2: адаптеры TAP/TUN/WireGuard (активные) ---
-    if (-not $result.VpnActive) {
-        $vpnAdapters = Get-NetAdapter | Where-Object {
-            $_.Name -match "(VPN|TAP|TUN|Wintun|WireGuard|OpenVPN|IKEv2|PPTP|L2TP)" -or
-            $_.InterfaceDescription -match "(VPN|TAP|TUN|Wintun|WireGuard|OpenVPN)"
+    if (-not $result.VpnActive -or $result.VpnName -eq "Yggdrasil") {
+        $vpnAdapters = Get-NetAdapter -IncludeHidden | Where-Object {
+            $_.Name -match "(VPN|TAP|TUN|Wintun|WireGuard|OpenVPN|IKEv2|PPTP|L2TP|Amnezia|awg|WG Tunnel)" -or
+            $_.InterfaceDescription -match "(VPN|TAP|TUN|Wintun|WireGuard|OpenVPN|Amnezia|awg|Tunnel)"
         }
-        $upVpn = $vpnAdapters | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
+        $upVpn = $vpnAdapters | Where-Object { $_.Status -eq "Up" } 
         if ($upVpn) {
             $result.VpnName = $upVpn.Name -replace '[\\/:*?"<>|]', '_'
             $result.VpnActive = $true
@@ -221,8 +221,15 @@ function Get-ConnectionTypeDetailed {
     }
 
     # ========== 2. ОПРЕДЕЛЕНИЕ ОСНОВНОГО АДАПТЕРА (по маршруту по умолчанию) ==========
-    $defaultRoute = Get-NetRoute -DestinationPrefix "0.0.0.0/0" | Where-Object { $_.ifIndex -ne 0 } |
-                    Sort-Object -Property RouteMetric | Select-Object -First 1
+    $defaultRoute = Get-NetRoute -DestinationPrefix "0.0.0.0/0" | 
+        Where-Object { 
+            $adapter = Get-NetAdapter -ifIndex $_.ifIndex -ErrorAction SilentlyContinue
+            if (-not $adapter) { return $false }
+            # Исключаем VPN-адаптеры по ключевым словам
+            $isVpn = ($adapter.Name -match "(VPN|TAP|TUN|Wintun|WireGuard|OpenVPN|IKEv2|PPTP|L2TP|Amnezia|awg|Tunnel)") -or
+            ($adapter.InterfaceDescription -match "(VPN|TAP|TUN|Wintun|WireGuard|OpenVPN|Amnezia|awg|Tunnel)")
+            -not $isVpn   # оставляем только НЕ VPN
+        } | Sort-Object -Property RouteMetric | Sort-Object -Property ifMetric | Select-Object -First 1
 
     if ($defaultRoute) {
         $adapter = Get-NetAdapter -ifIndex $defaultRoute.ifIndex
@@ -280,120 +287,42 @@ $dnsTargets = @()  # Загрузится из файла
 # =============== ЗАГРУЗКА СПИСКОВ ИЗ ФАЙЛОВ ===============
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-# --- Универсальная загрузка текстового списка (построчно) ---
-function Load-TextList {
-    param($FileName, $DefaultContent)
+function Load-ItemList {
+    param($FileName, $DefaultItems = @(), $HeaderComment = "# Список целей`n# Формат: значение;комментарий")
     $path = Join-Path $scriptPath $FileName
-    if (Test-Path $path) {
-        $lines = Get-Content $path -Encoding UTF8 | Where-Object { 
-            $_.Trim() -ne "" -and $_ -notmatch '^\s*#'
-        }
-        if ($lines) { return $lines }
-    }
-    # Если файла нет или он пустой — создаём с примерами
-    $DefaultContent -join "`n" | Out-File $path -Encoding UTF8
-    Write-Host " Создан файл $FileName. Отредактируй его и запусти скрипт снова." -ForegroundColor Yellow
-    return $DefaultContent
-}
-
-# --- Загрузка целей для сканирования портов (формат: IP;комментарий) ---
-# --- Загрузка целей для сканирования портов (формат: IP;комментарий) ---
-function Load-ScanTargets {
-    param($FileName)
-    $path = Join-Path $scriptPath $FileName
-    $default = @()
     if (-not (Test-Path $path)) {
-        @"
-# Файл со списком целей для сканирования портов
-# Формат: IP;комментарий
-
-"@ | Out-File $path -Encoding UTF8
-        Write-Host " Создан файл $FileName. Добавь свои цели и запусти скрипт снова." -ForegroundColor Yellow
-        return $default
+        $HeaderComment | Out-File $path -Encoding UTF8
+        Write-Host "Создан $FileName. Добавьте данные и перезапустите." -ForegroundColor Yellow
+        Write-Host "Файл '$FileName' пуст)." -ForegroundColor Yellow 
+        return $DefaultItems
+    }
+    $fileSize = (Get-Item $path).Length
+    if ($fileSize -eq 0) {
+        Write-Host "Файл '$FileName' пуст" -ForegroundColor Yellow
+        return $DefaultItems
     }
     $result = @()
-    $lines = Get-Content $path -Encoding UTF8 | Where-Object { $_.Trim() -ne "" -and $_ -notmatch '^\s*#' }
-    foreach ($line in $lines) {
+    Get-Content $path -Encoding UTF8 | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -eq "" -or $line -match '^\s*#') { return }
         $parts = $line.Split(';')
-        if ($parts.Count -ge 1) {
-            $ip = $parts[0].Trim()
-            $comment = if ($parts.Count -ge 2) { $parts[1].Trim() } else { "" }
-            $result += [PSCustomObject]@{
-                IP      = $ip
-                Comment = $comment
-            }
-        }
+        $value = $parts[0].Trim()
+        $comment = if ($parts.Count -ge 2) { $parts[1].Trim() } else { "" }
+        $result += [PSCustomObject]@{ Value = $value; Comment = $comment }
+    }
+    if ($result.Count -eq 0) {
+        Write-Host "Файл '$FileName' пуст" -ForegroundColor Yellow
+        return $DefaultItems
     }
     return $result
 }
 
-# --- Загрузка целей для трассировки (формат: IP;комментарий) ---
-function Load-TraceTargets {
-    param($FileName)
-    $path = Join-Path $scriptPath $FileName
-    $default = @()
-    if (-not (Test-Path $path)) {
-        @"
-# Файл со списком целей для трассировки
-# Формат: IP;комментарий
-
-"@ | Out-File $path -Encoding UTF8
-        Write-Host " Создан файл $FileName. Добавь свои цели и комментарии, затем запусти скрипт снова." -ForegroundColor Yellow
-        return $default
-    }
-    $result = @()
-    $lines = Get-Content $path -Encoding UTF8 | Where-Object {
-        $_.Trim() -ne "" -and $_ -notmatch '^\s*#'
-    }
-    foreach ($line in $lines) {
-        $parts = $line.Split(';')
-        if ($parts.Count -ge 1) {
-            $ip = $parts[0].Trim()
-            $comment = if ($parts.Count -ge 2) { $parts[1].Trim() } else { "" }
-            $result += [PSCustomObject]@{
-                IP      = $ip
-                Comment = $comment
-            }
-        }
-    }
-    return $result
-}
-
-# --- Загрузка DNS-серверов (формат: хост;комментарий) ---
-function Load-DnsTargets {
-    param($FileName)
-    $path = Join-Path $scriptPath $FileName
-    $default = @(
-        @{Host="8.8.8.8"; Comment="Google Public DNS"}
-    
-    )
-    if (-not (Test-Path $path)) {
-        @"
-
-"@ | Out-File $path -Encoding UTF8
-        Write-Host " Создан файл $FileName. Отредактируй его и запусти скрипт снова." -ForegroundColor Yellow
-        return $default
-    }
-    $result = @()
-    $lines = Get-Content $path -Encoding UTF8 | Where-Object { 
-        $_.Trim() -ne "" -and $_ -notmatch '^\s*#' 
-    }
-    foreach ($line in $lines) {
-        $parts = $line.Split(';')
-        if ($parts.Count -ge 1) {
-            $hostname = $parts[0].Trim()
-            $comment = if ($parts.Count -ge 2) { $parts[1].Trim() } else { "—" }
-            $result += @{Host = $hostname; Comment = $comment}
-        }
-    }
-    if ($result.Count -gt 0) { return $result } else { return $default }
-}
 
 # --- ЗАГРУЖАЕМ ВСЕ СПИСКИ ---
-$sites         = Load-TextList -FileName "sites.txt"        
-$traceTargets  = Load-TraceTargets -FileName "trace_targets.txt" 
-$scanTargets   = Load-ScanTargets -FileName "scan_targets.txt"
-$dnsTargets    = Load-DnsTargets  -FileName "dns_targets.txt"
+$sites         = Load-ItemList -FileName "sites.txt"        
+$traceTargets  = Load-ItemList -FileName "trace_targets.txt" 
+$scanTargets   = Load-ItemList -FileName "scan_targets.txt"
+$dnsTargets    = Load-ItemList -FileName "dns_targets.txt"
 # ============================================================
 function Write-Log {
     param(
@@ -455,36 +384,45 @@ function Invoke-ServiceScan {
         27018= "MongoDB"
     }
 
-    # --- Локальная база уязвимостей ---
-    $vulnDB = @{
-        "OpenSSH" = @(
-            @{ VersionPattern = "8\.[0-5]"; CVE = "CVE-2021-28041"; Description = "Double-free vulnerability" }
-            @{ VersionPattern = "8\.[0-2]"; CVE = "CVE-2020-15778"; Description = "Command injection in scp" }
-            @{ VersionPattern = "7\.[0-9]"; CVE = "CVE-2016-6210"; Description = "User enumeration" }
-        )
-        "Apache" = @(
-            @{ VersionPattern = "2\.4\.49"; CVE = "CVE-2021-41773"; Description = "Path traversal" }
-            @{ VersionPattern = "2\.4\.50"; CVE = "CVE-2021-42013"; Description = "Path traversal (bypass)" }
-            @{ VersionPattern = "2\.4\.48"; CVE = "CVE-2021-34798"; Description = "NULL pointer dereference" }
-        )
-        "nginx" = @(
-            @{ VersionPattern = "1\.20\.[0-1]"; CVE = "CVE-2021-23017"; Description = "DNS resolver memory leak" }
-            @{ VersionPattern = "1\.18\.[0-9]"; CVE = "CVE-2020-11724"; Description = "Request smuggling" }
-        )
-        "ProFTPD" = @(
-            @{ VersionPattern = "1\.3\.5"; CVE = "CVE-2015-3306"; Description = "File copy vulnerability" }
-        )
-        "MySQL" = @(
-            @{ VersionPattern = "5\.7\.[0-9]"; CVE = "CVE-2020-2760"; Description = "Privilege escalation" }
-            @{ VersionPattern = "8\.0\.[0-9]"; CVE = "CVE-2020-14586"; Description = "Buffer overflow" }
-        )
-        "PostgreSQL" = @(
-            @{ VersionPattern = "9\.[0-6]"; CVE = "CVE-2019-10208"; Description = "Bypass authentication" }
-        )
-        "vsftpd" = @(
-            @{ VersionPattern = "2\.3\.[2-4]"; CVE = "CVE-2011-0762"; Description = "Backdoor command execution" }
-        )
-    }
+    # --- Локальная база уязвимостей (актуальная на апрель 2026) ---
+$vulnDB = @{
+    "OpenSSH" = @(
+        @{ VersionPattern = "8\.[0-9]|9\.[0-9]"; CVE = "CVE-2025-61984"; Description = "Уязвимость в обработке управляющих символов в именах пользователей при использовании ProxyCommand, позволяющая выполнить произвольный код" }
+        @{ VersionPattern = "8\.[0-9]|9\.[0-9]"; CVE = "CVE-2025-61985"; Description = "Обработка NULL-символов в ssh:// URI, потенциально приводящая к выполнению произвольного кода при использовании ProxyCommand" }
+        @{ VersionPattern = "8\.[0-9]p?|9\.[0-9]p?"; CVE = "CVE-2026-3497"; Description = "Ошибка в GSSAPI Key Exchange может привести к отказу в обслуживании (DoS) или выполнению произвольного кода" }
+        @{ VersionPattern = "8\.[0-9]p?|9\.[0-9]p?"; CVE = "CVE-2025-26465"; Description = "Клиент и сервер уязвимы к отказу в обслуживании (DoS) при обработке пакетов SSH2_MSG_PING" }
+        @{ VersionPattern = "8\.[0-9]p?|9\.[0-9]p?"; CVE = "CVE-2025-32728"; Description = "Директива DisableForwarding в sshd не соответствует документации и не отключает X11 и forwarding агента" }
+    )
+    "Apache" = @(
+        @{ VersionPattern = "2\.4\.[0-9]+"; CVE = "CVE-2025-59775"; Description = "SSRF-уязвимость в Windows с AllowEncodedSlashes On и MergeSlashes Off, приводящая к утечке NTLM-хэшей" }
+        @{ VersionPattern = "2\.4\.[0-9]+"; CVE = "CVE-2025-66200"; Description = "Обход mod_userdir+suexec через AllowOverride FileInfo, позволяющий CGI-скриптам выполняться от неожиданного пользователя" }
+        @{ VersionPattern = "2\.4\.[0-9]+"; CVE = "CVE-2025-58098"; Description = "Вставка строки запроса в #exec cmd=... в SSI, раскрывающая конфиденциальную информацию" }
+    )
+    "nginx" = @(
+        @{ VersionPattern = "1\.[0-9]+\.[0-9]+"; CVE = "CVE-2026-1642"; Description = "Атака внедрения в SSL upstream, позволяющая внедрять данные в ответ от SSL-бэкенда" }
+        @{ VersionPattern = "1\.[0-9]+\.[0-9]+"; CVE = "CVE-2025-23419"; Description = "Обход client certificate authentication через возобновление сессий TLS, если несколько серверных блоков используют общий IP и порт" }
+        @{ VersionPattern = "1\.[0-9]+\.[0-9]+"; CVE = "CVE-2025-15566"; Description = "RCE-уязвимость в Ingress-Nginx через инъекцию конфигурации в аннотацию auth-proxy-set-headers" }
+        @{ VersionPattern = "1\.[0-9]+\.[0-9]+"; CVE = "CVE-2026-27944"; Description = "Неавторизованный доступ к резервным копиям сервера Nginx UI с возможностью их расшифровки, раскрывая конфиденциальные данные" }
+    )
+    "MySQL" = @(
+        @{ VersionPattern = "5\.7\.[0-9]+|8\.0\.[0-9]+|9\.[0-9]+\.[0-9]+"; CVE = "CVE-2025-50088"; Description = "DoS-уязвимость в компоненте InnoDB (повешение или повторяемый крах)" }
+        @{ VersionPattern = "5\.7\.[0-9]+|8\.0\.[0-9]+|9\.[0-9]+\.[0-9]+"; CVE = "CVE-2025-50087"; Description = "Модификация критических данных через компонент Server: Optimizer" }
+        @{ VersionPattern = "5\.7\.[0-9]+|8\.0\.[0-9]+|9\.[0-9]+\.[0-9]+"; CVE = "CVE-2025-50085"; Description = "Нарушение целостности и DoS через компонент InnoDB" }
+    )
+    "PostgreSQL" = @(
+        @{ VersionPattern = "13\.[0-9]+|14\.[0-9]+|15\.[0-9]+|16\.[0-9]+|17\.[0-9]+"; CVE = "CVE-2025-8714"; Description = "Внедрение произвольного кода в клиент psql через pg_dump/pg_dumpall/pg_restore" }
+        @{ VersionPattern = "13\.[0-9]+|14\.[0-9]+|15\.[0-9]+"; CVE = "CVE-2025-12817"; Description = "Отсутствие авторизации в CREATE STATISTICS, приводящее к DoS" }
+        @{ VersionPattern = "13\.[0-9]+|14\.[0-9]+|15\.[0-9]+|16\.[0-9]+|17\.[0-9]+"; CVE = "CVE-2025-12818"; Description = "Integer wraparound в libpq, вызывающий segmentation fault" }
+    )
+    "ProFTPD" = @(
+        @{ VersionPattern = "1\.3\.[0-9]+[a-z]?"; CVE = "CVE-2024-57392"; Description = "Переполнение буфера, приводящее к удаленному выполнению кода или DoS" }
+        @{ VersionPattern = "1\.3\.[0-9]+[a-z]?"; CVE = "CVE-2024-xxxx"; Description = "Уязвимость Terrapin (machine-in-the-middle) при использовании шифра chacha20-poly1305" }
+    )
+    "vsftpd" = @(
+        @{ VersionPattern = "3\.[0-9]+\.[0-9]+"; CVE = "CVE-2025-14242"; Description = "Integer overflow в парсинге ls команды через STAT команду, приводящий к DoS" }
+        @{ VersionPattern = "2\.[0-9]+\.[0-9]+|3\.[0-9]+\.[0-9]+"; CVE = "CVE-2025-44654"; Description = "Неправильное включение chroot_local_user, приводящее к эскалации привилегий" }
+    )
+}
 
     # --- Функция проверки уязвимостей ---
     function Test-Vulnerabilities {
@@ -574,9 +512,16 @@ function Invoke-ServiceScan {
     }
 
     foreach ($target in $Targets) {
-        Write-Log "`n Сканирование $($target.IP) [$($target.Comment)]" -Color Magenta -LogFile $LogFile
-        Write-Log " Используется последовательное сканирование. Рекомендуется PowerShell 7." -Color Yellow -LogFile $LogFile
-
+        $ip = if ($target.IP) { $target.IP } 
+              elseif ($target.Value) { $target.Value }
+              else { $null }
+        $comment = $target.Comment
+        if ([string]::IsNullOrWhiteSpace($ip)) {
+            Write-Log "Пропуск цели: отсутствует IP/домен (комментарий: $comment)" -Color Yellow -LogFile $LogFile
+            continue
+        }
+        $displayName = if ($comment) { "$ip ($comment)" } else { $ip }
+        Write-Log "`n Сканирование $displayName" -Color Magenta -LogFile $LogFile
         $results = @()  # соберём все результаты
 
         # Сканируем все порты и собираем информацию
@@ -584,7 +529,7 @@ function Invoke-ServiceScan {
             $tcp = New-Object System.Net.Sockets.TcpClient
             $open = $false
             try {
-                $connect = $tcp.BeginConnect($target.IP, $port, $null, $null)
+                $connect = $tcp.BeginConnect($ip, $port, $null, $null)
                 $wait = $connect.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
                 if ($wait -and $tcp.Connected) {
                     $tcp.EndConnect($connect)
@@ -597,7 +542,7 @@ function Invoke-ServiceScan {
             }
 
             if ($open) {
-                $info = Get-BannerInfo -hostIP $target.IP -port $port -timeout $BannerTimeoutMs
+                $info = Get-BannerInfo -hostIP $ip -port $port -timeout $BannerTimeoutMs
                 $results += $info
             } else {
                 $results += [PSCustomObject]@{
@@ -671,7 +616,8 @@ function Invoke-ServiceScan {
 function Invoke-WebCheck {
     param($LogFile)
     Write-Log "--- ДОСТУПНОСТЬ САЙТОВ ---" -Color Green -LogFile $LogFile
-    foreach ($site in $sites) {
+    foreach ($item in $sites) {
+        $site = if ($item -is [string]) { $item } else { $item.Value }
         $url = if ($site.StartsWith("http")) { $site } else { "https://$site" }
         $start = Get-Date
         try {
@@ -690,6 +636,17 @@ function Invoke-WebCheck {
             } else {
                 Write-Log "[FAIL] $site - $($_.Exception.Message)" -Color Red -LogFile $LogFile
             }
+        } catch [System.Net.Http.HttpRequestException] {
+            # Для PowerShell 7 / .NET Core
+            if ($_.Exception.Message -like "*timeout*") {
+                Write-Log "[FAIL] $site - нет ответа 5 сек" -Color Red -LogFile $LogFile
+            } else {
+                Write-Log "[FAIL] $site - $($_.Exception.Message)" -Color Red -LogFile $LogFile
+            }
+        } catch [System.OperationCanceledException] {
+            # Тоже возможный тип при тайм-ауте
+            Write-Log "[FAIL] $site - нет ответа 5 сек" -Color Red -LogFile $LogFile
+
         } catch {
             Write-Log "[ERROR] $site - $($_.Exception.Message)" -Color Red -LogFile $LogFile
         }
@@ -751,7 +708,8 @@ function Invoke-WebAndDnsDiagnostics {
 
     Write-Log "Участвуют DNS-серверы:" -Color Cyan -LogFile $LogFile
     foreach ($dns in $allDnsServers) {
-        Write-Log "  $($dns.Host) [$($dns.Comment)]" -Color Gray -LogFile $LogFile
+        $hostAddr = if ($dns.Host) { $dns.Host } elseif ($dns.Value) { $dns.Value } else { "Неизвестно" }
+        Write-Log "  $hostAddr [$($dns.Comment)]" -Color Gray -LogFile $LogFile
     }
     Write-Log "" -LogFile $LogFile
 
@@ -759,7 +717,21 @@ function Invoke-WebAndDnsDiagnostics {
     $total = $sites.Count
     $i = 0
 
-    foreach ($domain in $sites) {
+    foreach ($item in $sites) {
+        $domain = $null
+        if ($item -is [string]) {
+            $domain = $item
+        } elseif ($item -is [PSCustomObject] -or $item -is [hashtable]) {
+            if ($item.Value) { $domain = $item.Value }
+            elseif ($item.IP) { $domain = $item.IP }
+            elseif ($item.Host) { $domain = $item.Host }
+            elseif ($item.Site) { $domain = $item.Site }
+            else { $domain = $null }
+        }
+        if ([string]::IsNullOrWhiteSpace($domain)) {
+            Write-Log "Пропуск: не удалось извлечь домен из элемента: $($item | Out-String)" -Color Yellow -LogFile $LogFile
+            continue
+        }    
         $i++
         Write-Progress -Activity "Диагностика сайтов" -Status "$domain" -PercentComplete (($i / $total) * 100)
 
@@ -848,9 +820,12 @@ function Invoke-WebAndDnsDiagnostics {
         # --- Заголовок ---
         $header = "Сайт".PadRight($domainWidth) + " │ " + "Доступность".PadRight($httpWidth)
         foreach ($dns in $allDnsServers) {
-            $colName = "$($dns.Host) [$($dns.Comment)]"
-            # Обрежем, если слишком длинное
-            if ($colName.Length -gt $dnsColWidth) { $colName = $colName.Substring(0, $dnsColWidth - 3) + ".." }
+            $hostAddr = if ($null -ne $dns.Host) { $dns.Host } elseif ($null -ne $dns.Value) { $dns.Value } else { "?" }
+            $comment = if ($null -ne $dns.Comment) { $dns.Comment } else { "" }
+            $colName = "$hostAddr [$comment]"
+            if ($colName.Length -gt $dnsColWidth) { 
+                $colName = $colName.Substring(0, $dnsColWidth - 3) + ".." 
+            }
             $header += " │ " + $colName.PadRight($dnsColWidth)
         }
         Write-Log $header -Color Cyan -LogFile $LogFile
@@ -889,15 +864,21 @@ function Invoke-WebAndDnsDiagnostics {
 # --- ТРАССИРОВКА ---
 function Analyze-Trace {
     param(
-        $TargetInfo,   # объект с полями IP и Comment
+        $TargetInfo,  
         $LogFile
     )
-
-    $target = $TargetInfo.IP
+    $target = if ($TargetInfo.IP) { $TargetInfo.IP } 
+              elseif ($TargetInfo.Value) { $TargetInfo.Value } 
+              else { $null }
     $comment = $TargetInfo.Comment
-    if ($comment) { $displayTarget = "$target ($comment)" } else { $displayTarget = $target }
 
-    # Свой заголовок (выводится в меню, но если нужно, можно оставить здесь, но у нас он уже есть в меню)
+    if ([string]::IsNullOrWhiteSpace($target)) {
+        Write-Log "Ошибка: отсутствует IP/домен для трассировки (комментарий: $comment)" -Color Red -LogFile $LogFile
+        return
+    }
+
+    $displayTarget = if ($comment) { "$target ($comment)" } else { $target }
+
     Write-Log "`nТрассировка до $displayTarget ..." -Color Magenta -LogFile $LogFile
 
     try {
@@ -1074,18 +1055,33 @@ function Start-Report {
 # =============== МЕНЮ ===============
 function Show-Menu {
     Write-Host "`n========== МЕНЮ ==========" -ForegroundColor Cyan
-    Write-Host "1 - Проверить сайты (только HTTP)" -ForegroundColor Yellow
-    Write-Host "2 - Полная диагностика (HTTP + DNS)" -ForegroundColor Yellow
-    Write-Host "3 - Трассировка (из списка)" -ForegroundColor Yellow
-    Write-Host "4 - Трассировка (свой хост)" -ForegroundColor Yellow
-    Write-Host "5 - Сканирование серверов" -ForegroundColor Yellow
-    Write-Host "6 - Всё вместе (трассировка + порты + диагностика)" -ForegroundColor Yellow
-    Write-Host "7 - Инструкция" -ForegroundColor Yellow
-    Write-Host "8 - Проверить обновления" -ForegroundColor Yellow
+    Write-Host "1 - Проверить доступность сайтов" -ForegroundColor Yellow
+    Write-Host "2 - Трассировка" -ForegroundColor Yellow
+    Write-Host "3 - Сканирование серверов" -ForegroundColor Yellow
+    Write-Host "4 - Всё вместе (трассировка + порты + диагностика)" -ForegroundColor Yellow
+    Write-Host "5 - Настройки" -ForegroundColor Yellow
     Write-Host "0 - Выход" -ForegroundColor Yellow
     Write-Host "===========================" -ForegroundColor Cyan
 }
-
+function Show-Menu-Invoke {
+    Write-Host "`n========== Доступность сайтов ==========" -ForegroundColor Cyan
+    Write-Host "1 - Проверить сайты (только HTTP)" -ForegroundColor Yellow
+    Write-Host "2 - Полная диагностика (HTTP + DNS)" -ForegroundColor Yellow
+    Write-Host "3 - Полная диагностика (свой хост)" -ForegroundColor Yellow
+    Write-Host "0 - Назад" -ForegroundColor Yellow
+}
+function Show-Menu-Trace {
+    Write-Host "`n========== Трассировка ==========" -ForegroundColor Cyan
+    Write-Host "1 - Трассировка (из списка)" -ForegroundColor Yellow
+    Write-Host "2 - Трассировка (свой хост)" -ForegroundColor Yellow
+    Write-Host "0 - Назад" -ForegroundColor Yellow
+}
+function Show-Menu-Settings {
+    Write-Host "`n========== Настройки ==========" -ForegroundColor Cyan
+    Write-Host "1 - Инструкция" -ForegroundColor Yellow
+    Write-Host "2 - Проверить обновления" -ForegroundColor Yellow
+    Write-Host "0 - Назад" -ForegroundColor Yellow
+}
 do {
     Write-Host "`nVersion $scriptVersion" -ForegroundColor Gray
     Check-Version
@@ -1094,44 +1090,97 @@ do {
 
     switch ($choice) {
         "1" {
-	    $logFile = Start-Report -FolderKey "http"
-            Invoke-WebCheck -LogFile $logFile
-        }        
-        "2" {
-	    $logFile = Start-Report -FolderKey "dns_full"
-            if ($dnsCheckEnabled) {
-                Invoke-WebAndDnsDiagnostics -LogFile $logFile
-            } else {
-                Write-Log "DNS-проверка отключена в настройках." -Color Red -LogFile $logFile
-            }
+            do {
+                Show-Menu-Invoke
+                $choice_invoke = Read-Host "Выберите действие"
+                switch ($choice_invoke) {
+                    "1" {
+	                    $logFile = Start-Report -FolderKey "http"
+                        Invoke-WebCheck -LogFile $logFile
+                    }        
+                    "2" {
+	                    $logFile = Start-Report -FolderKey "dns_full"
+                        if ($dnsCheckEnabled) {
+                            Invoke-WebAndDnsDiagnostics -LogFile $logFile
+                        } else {
+                            Write-Log "DNS-проверка отключена в настройках." -Color Red -LogFile $logFile
+                        }
+                    }
+                    "3" {
+                        $custom = Read-Host "Введите IP или домен"
+                        if (-not $custom) {
+                            Write-Host "Ничего не введено. Возврат в меню." -ForegroundColor Yellow
+                            break
+                        }
+                        $oldSites = $sites
+                        $sites = @( [PSCustomObject]@{ Value = $custom; Comment = "Ручной ввод" })
+                        $logFile = Start-Report -FolderKey "dns_full"
+                        Invoke-WebAndDnsDiagnostics -LogFile $logFile
+                        $sites = $oldSites
+                    }
+                    "0" {}      
+                    default {
+                        Write-Host "Неверный ввод, попробуйте снова." -ForegroundColor Red
+                    }
+                }
+
+                if ($choice_invoke -ne "0" ) {
+                    Write-Log "`n========================================================" -Color Cyan -LogFile $logFile
+                    Write-Log "Отчёт сохранён в файл:" -Color Cyan -LogFile $logFile
+                    Write-Log "   $logFile" -Color Yellow -LogFile $logFile
+                    Write-Log "========================================================" -Color Cyan -LogFile $logFile
+                    Write-Host "`nНажмите Enter для продолжения..." -ForegroundColor Gray
+                    Read-Host | Out-Null
+                } 
+            } while ($choice_invoke -ne "0")
+            
+        }
+        "2" {            
+            do {
+                Show-Menu-Trace
+                $choice_trace = Read-Host "Выберите действие"
+                switch ($choice_trace) {
+                    "1" {
+	                    $logFile = Start-Report -FolderKey "trace"
+                        Write-Log "`n--- ТРАССИРОВКА (макс. $maxHops хопов, таймаут ${pingTimeout}мс) ---" -Color Green -LogFile $logFile
+                        foreach ($target in $traceTargets) {
+                            Analyze-Trace -TargetInfo $target -LogFile $logFile
+                        }
+                    }
+                    "2" {
+                        $custom = Read-Host "Введите IP или домен"
+                        if ($custom) {
+                            $logFile = Start-Report -FolderKey "trace"
+                            Write-Log "`n--- ТРАССИРОВКА (макс. $maxHops хопов, таймаут ${pingTimeout}мс) ---" -Color Green -LogFile $logFile
+                            $targetObj = [PSCustomObject]@{ IP = $custom; Comment = "" }
+                            Analyze-Trace -TargetInfo $targetObj -LogFile $logFile
+                        }
+                    }
+                    "0" {}
+                    default {
+                        Write-Host "Неверный ввод, попробуйте снова." -ForegroundColor Red
+                    }
+                }
+
+                if ($choice_trace -ne "0" ) {
+                    Write-Log "`n========================================================" -Color Cyan -LogFile $logFile
+                    Write-Log "Отчёт сохранён в файл:" -Color Cyan -LogFile $logFile
+                    Write-Log "   $logFile" -Color Yellow -LogFile $logFile
+                    Write-Log "========================================================" -Color Cyan -LogFile $logFile
+                    Write-Host "`nНажмите Enter для продолжения..." -ForegroundColor Gray
+                    Read-Host | Out-Null
+                } 
+            } while ($choice_trace -ne "0")
         }
         "3" {
-	    $logFile = Start-Report -FolderKey "trace"
-            Write-Log "`n--- ТРАССИРОВКА (макс. $maxHops хопов, таймаут ${pingTimeout}мс) ---" -Color Green -LogFile $logFile
-            foreach ($target in $traceTargets) {
-                Analyze-Trace -TargetInfo $target -LogFile $logFile
-            }
+	        $logFile = Start-Report -FolderKey "service_scan"
+            Invoke-ServiceScan -LogFile $logFile -Targets $scanTargets
         }
         "4" {
-            $custom = Read-Host "Введите IP или домен"
-    if ($custom) {
-        $logFile = Start-Report -FolderKey "trace"
-        Write-Log "`n--- ТРАССИРОВКА (макс. $maxHops хопов, таймаут ${pingTimeout}мс) ---" -Color Green -LogFile $logFile
-        # Создаём объект с пустым комментарием
-        $targetObj = [PSCustomObject]@{ IP = $custom; Comment = "" }
-        Analyze-Trace -TargetInfo $targetObj -LogFile $logFile
-            }
-        }
-        
-        "5" {
-	    $logFile = Start-Report -FolderKey "service_scan"
-        Invoke-ServiceScan -LogFile $logFile -Targets $scanTargets
-        }
-        "6" {
-	    $logFile = Start-Report -FolderKey "all"
+	        $logFile = Start-Report -FolderKey "all"
             Invoke-WebCheck -LogFile $logFile
             Write-Log "" -LogFile $logFile
-                        if ($dnsCheckEnabled) {
+            if ($dnsCheckEnabled) {
                 Invoke-WebAndDnsDiagnostics -LogFile $logFile
             } else {
                 Write-Log "DNS-проверка отключена в настройках." -Color Yellow -LogFile $logFile
@@ -1144,103 +1193,134 @@ do {
             Invoke-ServiceScan -LogFile $logFile -Targets $scanTargets
             Write-Log "" -LogFile $logFile
         }
-    "7" {
-    Write-Host ""
-    Write-Host "╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║                      ИНСТРУКЦИЯ ПО СКРИПТУ                       ║" -ForegroundColor Cyan
-    Write-Host "╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "1. ФАЙЛЫ НАСТРОЕК (лежат в папке со скриптом, создаются при первом запуске):"
-    Write-Host "   ----------------------------------------------------------------"
-    Write-Host "   📄 sites.txt           — список сайтов для проверки доступности."
-    Write-Host "                           Каждый сайт с новой строки."
-    Write-Host "                           Пример: t.me, discord.com, youtube.com"
-    Write-Host ""
-    Write-Host "   📄 trace_targets.txt   — цели для трассировки (IP или домены)."
-    Write-Host "                           Можно добавлять комментарии через точку с запятой."
-    Write-Host "                           Пример: 94.131.109.144;Франкфурт"
-    Write-Host ""
-    Write-Host "   📄 scan_targets.txt    — цели для сканирования серверов (только IP)."
-    Write-Host "                           Формат: IP;комментарий"
-    Write-Host "                           Пример: 94.131.109.144;Франкфурт"
-    Write-Host ""
-    Write-Host "   📄 dns_targets.txt     — DNS-серверы для сравнения."
-    Write-Host "                           Формат: IP;комментарий"
-    Write-Host "                           Пример: 8.8.8.8;Google Public DNS"
-    Write-Host ""
-    Write-Host "   💡 Все файлы можно редактировать Блокнотом. Строки, начинающиеся с #,"
-    Write-Host "      игнорируются (можно оставлять комментарии)."
-    Write-Host ""
-    Write-Host "2. ЛОГИ (сохраняются в папку Logs рядом со скриптом):"
-    Write-Host "   ----------------------------------------------------------------"
-    Write-Host "   📁 Logs/"
-    Write-Host "      └─── [Тип подключения]_[Детали]+[VPN]/"
-    Write-Host "           └─── [тип проверки]/"
-    Write-Host "                ГГГГ-ММ-ДД_ЧЧММСС.txt"
-    Write-Host ""
-    Write-Host "   🔹 Тип подключения: Wi-Fi / Модем / Проводное"
-    Write-Host "   🔹 Детали: для Wi-Fi — имя сети (SSID), для остальных — имя адаптера."
-    Write-Host "   🔹 VPN: добавляется суффикс +VPN_Имя, если активен VPN."
-    Write-Host "   🔹 Типы проверок: http, trace, service_scan, dns_full, all"
-    Write-Host ""
-    Write-Host "   Пример: Logs\Wi-Fi_Stonehenge+VPN_WorkVPN\trace\2026-02-14_152030.txt"
-    Write-Host ""
-    Write-Host "3. ЧТО ДЕЛАЕТ КАЖДЫЙ ПУНКТ МЕНЮ:"
-    Write-Host "   ----------------------------------------------------------------"
-    Write-Host "   1  Проверить сайты (только HTTP)"
-    Write-Host "        • Проверяет доступность сайтов из sites.txt."
-    Write-Host "        • Использует команду: Invoke-WebRequest -Method Head."
-    Write-Host "        • Результат: [OK] — доступен, [FAIL] — нет ответа 5 сек,"
-    Write-Host "          [ERROR] — ошибка соединения."
-    Write-Host ""
-    Write-Host "   2  Трассировка (из списка)"
-    Write-Host "        • Запускает tracert для каждой цели из trace_targets.txt."
-    Write-Host "        • Показывает маршрут с потерями пакетов."
-    Write-Host "        • Анализ: определяет, достигнута ли цель и есть ли ответ."
-    Write-Host ""
-    Write-Host "   3  Трассировка (свой хост)"
-    Write-Host "        • То же, что пункт 2, но для одного введённого вручную IP/домена."
-    Write-Host ""
-    Write-Host "   4  Сканирование серверов"
-    Write-Host "        • Сканирует популярные порты (около 25) на всех IP из scan_targets.txt."
-    Write-Host "        • Определяет ОС сервера."
-    Write-Host "        • Проверяет найденные версии на известные уязвимости (локальная база)."
-    Write-Host "        • Выводит список открытых портов и статус."
-    Write-Host ""
-    Write-Host "   5  Полная диагностика (HTTP + DNS)"
-    Write-Host "        • Для каждого сайта из sites.txt: HTTP-доступность и сравнение ответов"
-    Write-Host "          от всех DNS из dns_targets.txt (плюс системный DNS)."
-    Write-Host "        • Выводит таблицу с IP и временем ответа, отмечая подмены."
-    Write-Host ""
-    Write-Host "   6  Всё вместе"
-    Write-Host "        • Последовательно выполняет пункты 1, 2, 4, 5 в одном отчёте."
-    Write-Host "        • Лог сохраняется в папку all."
-    Write-Host ""
-    Write-Host "   7  Инструкция (этот текст)"
-    Write-Host ""
-    Write-Host "   8  Проверить обновления"
-    Write-Host "        • Сравнивает версию скрипта с GitHub и предлагает обновление."
-    Write-Host ""
-    Write-Host "   0  Выход"
-    Write-Host ""
-    Write-Host "4. КАК ПОНИМАТЬ РЕЗУЛЬТАТЫ:"
-    Write-Host "   ----------------------------------------------------------------"
-    Write-Host "     Доступен / ОТКРЫТ — всё хорошо."
-    Write-Host "     Ошибка / ЗАКРЫТ — ресурс недоступен (возможно, блокировка)."
-    Write-Host "     ПОДМЕНА — DNS вернул IP, отличный от эталонного (8.8.8.8)."
-    Write-Host "     Цель не достигнута — трассировка оборвалась (возможная блокировка)."
-    Write-Host ""
-    Write-Host "   📍 Коды ответов HTTP:"
-    Write-Host "        200 — OK"
-    Write-Host "        404 — не найдено"
-    Write-Host "        405 — метод не поддерживается"
-    Write-Host "        308 — постоянный редирект"
-    Write-Host ""
+        "5" {            
+            do {
+                Show-Menu-Settings
+                $choice_settings = Read-Host "Выберите действие"
+                switch ($choice_settings) {
+                    "1" {
+Write-Host ""
+Write-Host "╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+Write-Host "║                      ИНСТРУКЦИЯ ПО СКРИПТУ                       ║" -ForegroundColor Cyan
+Write-Host "╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "1. ФАЙЛЫ НАСТРОЕК (лежат в папке со скриптом, создаются при первом запуске):"
+Write-Host "   ----------------------------------------------------------------"
+Write-Host "   📄 sites.txt           — список сайтов для проверки доступности."
+Write-Host "                           Каждый сайт с новой строки."
+Write-Host "                           Пример: t.me, discord.com, youtube.com"
+Write-Host ""
+Write-Host "   📄 trace_targets.txt   — цели для трассировки (IP или домены)."
+Write-Host "                           Можно добавлять комментарии через точку с запятой."
+Write-Host "                           Пример: 64.151.174.125;Рейкьявик"
+Write-Host ""
+Write-Host "   📄 scan_targets.txt    — цели для сканирования серверов (только IP)."
+Write-Host "                           Формат: IP;комментарий"
+Write-Host "                           Пример: 64.151.174.125;Рейкъявик"
+Write-Host ""
+Write-Host "   📄 dns_targets.txt     — DNS-серверы для сравнения."
+Write-Host "                           Формат: IP;комментарий"
+Write-Host "                           Пример: 8.8.8.8;Google Public DNS"
+Write-Host ""
+Write-Host "   💡 Все файлы можно редактировать Блокнотом. Строки, начинающиеся с #,"
+Write-Host "      игнорируются (можно оставлять комментарии)."
+Write-Host ""
+Write-Host "2. ЛОГИ (сохраняются в папку Logs рядом со скриптом):"
+Write-Host "   ----------------------------------------------------------------"
+Write-Host "   📁 Logs/"
+Write-Host "      └─── [Тип подключения]_[Детали]+[VPN]/"
+Write-Host "           └─── [тип проверки]/"
+Write-Host "                ГГГГ-ММ-ДД_ЧЧММСС.txt"
+Write-Host ""
+Write-Host "   🔹 Тип подключения: Wi-Fi / Модем / Проводное"
+Write-Host "   🔹 Детали: для Wi-Fi — имя сети (SSID), для остальных — имя адаптера."
+Write-Host "   🔹 VPN: добавляется суффикс +VPN_Имя, если активен VPN."
+Write-Host "   🔹 Типы проверок: http, dns_full, trace, service_scan, all"
+Write-Host ""
+Write-Host "   Пример: Logs\Wi-Fi_Stonehenge+VPN_WorkVPN\trace\2026-02-14_152030.txt"
+Write-Host ""
+Write-Host "3. ГЛАВНОЕ МЕНЮ:"
+Write-Host "   ----------------------------------------------------------------"
+Write-Host "   1 — Проверить доступность сайтов (подменю: HTTP / полная диагностика / свой хост)"
+Write-Host "   2 — Трассировка (подменю: из списка / свой хост)"
+Write-Host "   3 — Сканирование серверов (порты + баннеры + уязвимости)"
+Write-Host "   4 — Всё вместе (HTTP + DNS + трассировка + сканирование портов)"
+Write-Host "   5 — Настройки (инструкция, проверка обновлений)"
+Write-Host "   0 — Выход"
+Write-Host ""
+Write-Host "4. ПОДРОБНОЕ ОПИСАНИЕ ПУНКТОВ:"
+Write-Host "   ----------------------------------------------------------------"
+Write-Host ""
+Write-Host "   📍 1 → Доступность сайтов:"
+Write-Host "       1.1  Проверить сайты (только HTTP)"
+Write-Host "            • Проверяет доступность сайтов из sites.txt методом HEAD."
+Write-Host "            • Результат: [OK] время ответа, [FAIL] таймаут 5 сек, [ERROR] ошибка."
+Write-Host "       1.2  Полная диагностика (HTTP + DNS)"
+Write-Host "            • Для каждого сайта: HTTP-доступность + разрешение через системный DNS"
+Write-Host "              и все DNS из dns_targets.txt. Выводится таблица с IP и временем ответа,"
+Write-Host "              отмечается возможная подмена DNS."
+Write-Host "       1.3  Полная диагностика (свой хост)"
+Write-Host "            • То же, что 1.2, но для одного введённого вручную домена/IP."
+Write-Host ""
+Write-Host "   📍 2 → Трассировка:"
+Write-Host "       2.1  Трассировка (из списка)"
+Write-Host "            • Запускает tracert для каждой цели из trace_targets.txt."
+Write-Host "            • Отображает маршрут до 30 хопов, таймаут 500 мс, анализирует потери."
+Write-Host "            • Дополнительно: для каждого публичного IP выполняется ping (3 пакета) для оценки потерь."
+Write-Host "       2.2  Трассировка (свой хост)"
+Write-Host "            • То же, но для одного IP/домена, введённого вручную."
+Write-Host ""
+Write-Host "   📍 3 → Сканирование серверов:"
+Write-Host "       • Сканирует список портов (21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,"
+Write-Host "         1723,3306,3389,5432,5900,6379,8080,8443,27017,27018) на всех IP из scan_targets.txt."
+Write-Host "       • Определяет открытые порты, пытается получить баннер, распознаёт сервис и версию."
+Write-Host "       • Определяет операционную систему по баннеру (Ubuntu, Debian, Windows и т.п.)."
+Write-Host "       • Проверяет найденные версии на известные уязвимости (локальная база CVE)."
+Write-Host "       • Выводит для каждой цели: открытые порты с сервисами, закрытые порты, найденные уязвимости."
+Write-Host ""
+Write-Host "   📍 4 → Всё вместе:"
+Write-Host "       • Последовательно выполняет: HTTP-проверку сайтов, полную DNS-диагностику,"
+Write-Host "         трассировку из списка и сканирование серверов. Все результаты в одном отчёте."
+Write-Host ""
+Write-Host "   📍 5 → Настройки:"
+Write-Host "       5.1  Инструкция — этот текст."
+Write-Host "       5.2  Проверить обновления — сравнивает текущую версию с GitHub и предлагает обновить."
+Write-Host ""
+Write-Host "5. КАК ПОНИМАТЬ РЕЗУЛЬТАТЫ:"
+Write-Host "   ----------------------------------------------------------------"
+Write-Host "   📍 Коды HTTP: 200 — OK, 404 — не найден, 405 — метод не разрешён, 308 — редирект."
+Write-Host "            • Результат: [OK] время ответа, [FAIL] таймаут 5 сек, [ERROR] ошибка."
+Write-Host "   📍 Трассировка:"
+Write-Host "       • Звёздочки ( * * * ) — потеря пакетов на хопе (красный цвет)."
+Write-Host "       • [local] — локальный IP (192.168.x.x, 10.x.x.x, 172.16-31.x.x)."
+Write-Host "       • В конце: достигнута ли цель и последний отвечающий узел."
+Write-Host "   📍 Сканирование портов:"
+Write-Host "       • ОТКРЫТ — порт доступен, сервис определён (или известный порт)."
+Write-Host "       • ЗАКРЫТ — порт не отвечает за таймаут (500 мс)."
+Write-Host "       • Уязвимости: выводятся CVE и краткое описание, если версия сервиса совпадает с шаблоном."
+Write-Host ""
+Write-Host "6. ПРИМЕЧАНИЯ:"
+Write-Host "   ----------------------------------------------------------------"
+Write-Host "   • При первом запуске создаются пустые файлы настроек. Заполните их данными."
+Write-Host "   • Отчёты автоматически сортируются по типу подключения и VPN."
+Write-Host "   • Логи старше 180 дней автоматически удаляются."
+Write-Host "   • Версия скрипта проверяется при каждом запуске; обновление — в пункте 5.2."
+Write-Host ""
+Write-Host "Нажмите Enter, чтобы вернуться в меню..." -ForegroundColor Gray
+Read-Host | Out-Null
 }
         
-        "8" {
+        "2" {
             Check-ForUpdates
-            }
+        }
+        "0" {}
+                    default {
+                        Write-Host "Неверный ввод, попробуйте снова." -ForegroundColor Red
+                    }
+                }
+            } 
+                while ($choice_settings -ne "0")
+        }        
         "0" {
             Write-Host "Работа завершена." -ForegroundColor Green
         }
@@ -1249,17 +1329,14 @@ do {
         }
     }
 
-        if ($choice -ne "0" -and $choice -ne "7" -and $choice -ne "8") {
+        if ($choice -ne "0" -and $choice -ne "1" -and $choice -ne "2" -and $choice -ne "5") {
         Write-Log "`n========================================================" -Color Cyan -LogFile $logFile
         Write-Log "Отчёт сохранён в файл:" -Color Cyan -LogFile $logFile
         Write-Log "   $logFile" -Color Yellow -LogFile $logFile
         Write-Log "========================================================" -Color Cyan -LogFile $logFile
         Write-Host "`nНажмите Enter для продолжения..." -ForegroundColor Gray
         Read-Host | Out-Null
-    } elseif ($choice -eq "7") {
-        # Для инструкции просто ждём Enter без сохранения
-        Write-Host "`nНажмите Enter, чтобы вернуться в меню..." -ForegroundColor Gray
-        Read-Host | Out-Null
     }
+    
 } while ($choice -ne "0")
 

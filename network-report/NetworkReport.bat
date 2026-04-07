@@ -1,3 +1,3 @@
 @echo off
-powershell -ExecutionPolicy Bypass -File "%~dp0NetworkReport.ps1"
+pwsh -ExecutionPolicy Bypass -File "%~dp0NetworkReport.ps1"
 pause

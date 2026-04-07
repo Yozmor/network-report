@@ -1,6 +1,6 @@
 # NetworkReport.ps1 - pure ASCII, no Unicode, no WHOIS, fast tracert
 # Версия скрипта – меняй вручную при каждом значимом обновлении
-$scriptVersion = "3.5"
+$scriptVersion = "3.6"
 
 
 $maxHops = 30
@@ -620,6 +620,7 @@ function Invoke-WebCheck {
         $site = if ($item -is [string]) { $item } else { $item.Value }
         $url = if ($site.StartsWith("http")) { $site } else { "https://$site" }
         $start = Get-Date
+        if ($PSVersionTable.PSVersion.Major -ge 6) {
         try {
             $response = Invoke-WebRequest -Uri $url -Method Head -TimeoutSec 5
             $ms = ((Get-Date) - $start).TotalMilliseconds
@@ -628,15 +629,8 @@ function Invoke-WebCheck {
             } else {
                 Write-Log "[?] $site - код ответа $($response.StatusCode)" -Color Yellow -LogFile $LogFile
             }
-        } catch [System.Net.WebException] {
-            if ($_.Exception.Message -like "*404*") {
-                Write-Log "[?] $site - не найден (404)" -Color Yellow -LogFile $LogFile
-            } elseif ($_.Exception.Message -like "*timed out*") {
-                Write-Log "[FAIL] $site - нет ответа 5 сек" -Color Red -LogFile $LogFile
-            } else {
-                Write-Log "[FAIL] $site - $($_.Exception.Message)" -Color Red -LogFile $LogFile
-            }
-        } catch [System.Net.Http.HttpRequestException] {
+        } 
+         catch [System.Net.Http.HttpRequestException] {
             # Для PowerShell 7 / .NET Core
             if ($_.Exception.Message -like "*timeout*") {
                 Write-Log "[FAIL] $site - нет ответа 5 сек" -Color Red -LogFile $LogFile
@@ -649,6 +643,29 @@ function Invoke-WebCheck {
 
         } catch {
             Write-Log "[ERROR] $site - $($_.Exception.Message)" -Color Red -LogFile $LogFile
+        }
+        }
+        else {
+            try {
+            $response = Invoke-WebRequest -Uri $url -Method Head -TimeoutSec 5
+            $ms = ((Get-Date) - $start).TotalMilliseconds
+            if ($response.StatusCode -eq 200) {
+                Write-Log "[OK] $site - доступен ($([math]::Round($ms)) мс)" -Color Green -LogFile $LogFile
+            } else {
+                Write-Log "[?] $site - код ответа $($response.StatusCode)" -Color Yellow -LogFile $LogFile
+            }
+        } 
+        catch [System.Net.WebException] {
+            if ($_.Exception.Message -like "*404*") {
+                Write-Log "[?] $site - не найден (404)" -Color Yellow -LogFile $LogFile
+            } elseif ($_.Exception.Message -like "*timed out*") {
+                Write-Log "[FAIL] $site - нет ответа 5 сек" -Color Red -LogFile $LogFile
+            } else {
+                Write-Log "[FAIL] $site - $($_.Exception.Message)" -Color Red -LogFile $LogFile
+            }
+        }catch {
+            Write-Log "[ERROR] $site - $($_.Exception.Message)" -Color Red -LogFile $LogFile
+        }
         }
     }
 }

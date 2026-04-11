@@ -1,17 +1,31 @@
 # NetworkReport.ps1 - pure ASCII, no Unicode, no WHOIS, fast tracert
-# Версия скрипта – меняй вручную при каждом значимом обновлении
-$scriptVersion = "3.6"
+$scriptVersion = "4.0"
 
+# =============== БЕЗОПАСНОЕ ОПРЕДЕЛЕНИЕ ПУТИ К СКРИПТУ ===============
+$scriptPath = $null
+if ($MyInvocation.MyCommand.Path) {
+    $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+if (-not $scriptPath -and $PSScriptRoot) {
+    $scriptPath = $PSScriptRoot
+}
+if (-not $scriptPath) {
+    try {
+        $scriptPath = [System.IO.Path]::GetDirectoryName([System.Reflection.Assembly]::GetExecutingAssembly().Location)
+    } catch { }
+}
+if (-not $scriptPath) {
+    $scriptPath = Get-Location
+}
 
-$scriptVersion = "3.6"
-
-# Определяем путь к скрипту (должен быть до всего, что использует $scriptPath)
-$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-# --- Конфигурация ---
+# --- ОПРЕДЕЛЕНИЕ ОСНОВНЫХ ПАПОК (после того как $scriptPath известен) ---
+$baseLogFolder = Join-Path $scriptPath "Logs"
+$toolsDir = Join-Path $scriptPath "Tools"
 $configPath = Join-Path $scriptPath "config.json"
 
+# --- Функции конфигурации ---
 function Save-Config {
+    param($config)
     $config | ConvertTo-Json | Out-File $configPath -Encoding UTF8
     Write-Host "Настройки сохранены в config.json" -ForegroundColor Gray
 }
@@ -19,36 +33,72 @@ function Save-Config {
 function Load-Config {
     if (Test-Path $configPath) {
         $config = Get-Content $configPath -Raw | ConvertFrom-Json
-    } else {
-        $config = @{
+        # Добавляем недостающие поля
+        $defaults = @{
+            MaxHops = 30
+            PingTimeout = 500
             ConnectionTimeout = 500
             BannerTimeout = 2000
+            HttpTimeout = 5
+            SpeedtestRetries = 2
             MaxLogAgeDays = 180
         }
-        Save-Config
+        foreach ($key in $defaults.Keys) {
+            if ($null -eq $config.$key) {
+                $config | Add-Member -NotePropertyName $key -NotePropertyValue $defaults[$key] -Force
+            }
+        }
+    } else {
+        $config = @{
+            MaxHops = 30
+            PingTimeout = 500
+            ConnectionTimeout = 500
+            BannerTimeout = 2000
+            HttpTimeout = 5
+            SpeedtestRetries = 2
+            MaxLogAgeDays = 180
+        }
+        Save-Config $config
     }
     return $config
 }
 
+# --- Загрузка конфигурации ---
 $config = Load-Config
 $maxHops = $config.MaxHops
 $maxLogAgeDays = $config.MaxLogAgeDays
 $global:nexttracePath = $null
 
+# --- Безопасная очистка логов ---
+function Remove-OldLogs {
+    if ([string]::IsNullOrWhiteSpace($baseLogFolder)) {
+        Write-Host "Очистка логов пропущена: папка логов не определена." -ForegroundColor Yellow
+        return
+    }
+    if (-not (Test-Path $baseLogFolder)) {
+        Write-Host "Очистка логов пропущена: папка '$baseLogFolder' не существует." -ForegroundColor Yellow
+        return
+    }
+    $dangerPaths = @("C:\", "D:\", "C:\Windows", "C:\Windows\System32", $env:TEMP, $env:WINDIR)
+    if ($dangerPaths -contains $baseLogFolder) {
+        Write-Host "Очистка логов запрещена для папки '$baseLogFolder'." -ForegroundColor Red
+        return
+    }
+    $cutoffDate = (Get-Date).AddDays(-$config.MaxLogAgeDays)
+    $oldFiles = Get-ChildItem $baseLogFolder -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cutoffDate }
+    if ($oldFiles) {
+        $oldFiles | Remove-Item -Force
+        Write-Host "Очищено $($oldFiles.Count) старых логов (старше $($config.MaxLogAgeDays) дней)." -ForegroundColor Gray
+    }
+}
+
+# --- Вызов очистки ---
+Remove-OldLogs
+
 # =============== АВТООБНОВЛЕНИЕ ===============
 $updateRepoUrl = "https://raw.githubusercontent.com/Yozmor/network-report/refs/heads/main/network-report/NetworkReport.ps1"
 
-function Get-ScriptPath {
-    # Возвращает путь к текущему скрипту
-    if ($MyInvocation.MyCommand.Path) {
-        return $MyInvocation.MyCommand.Path
-    } elseif ($PSScriptRoot) {
-        # Если скрипт запущен как модуль или через точку, используем PSScriptRoot + имя файла
-        return Join-Path $PSScriptRoot "NetworkReport.ps1"
-    } else {
-        return $null
-    }
-}
+
 
 function Get-LocalVersion {
     param([string]$Path)
@@ -73,11 +123,8 @@ function Check-ForUpdates {
     }
 
     try {
-        # Скачиваем raw-файл
         $remoteScript = Invoke-WebRequest -Uri $updateRepoUrl -TimeoutSec 5 -UseBasicParsing
         $remoteContent = $remoteScript.Content
-
-        # Ищем маркер версии в remote
         $remoteVersion = $null
         $lines = $remoteContent -split "`n"
         foreach ($line in $lines) {
@@ -90,15 +137,13 @@ function Check-ForUpdates {
                 break
             }
         }
-
         if (-not $remoteVersion) {
-            Write-Host " Не удалось определить версию в remote-файле. Проверьте raw-ссылку." -ForegroundColor Red
+            Write-Host " Не удалось определить версию в remote-файле." -ForegroundColor Red
             return
         }
 
-        # Получаем локальную версию
-        $scriptPath = Get-ScriptPath
-        $localVersion = Get-LocalVersion -Path $scriptPath
+        $scriptFile = Join-Path $scriptPath "NetworkReport.ps1"
+        $localVersion = Get-LocalVersion -Path $scriptFile
 
         if ($remoteVersion -eq $localVersion) {
             Write-Host " У вас актуальная версия ($localVersion)." -ForegroundColor Green
@@ -113,12 +158,11 @@ function Check-ForUpdates {
         Write-Host " Ошибка при проверке обновлений: $_" -ForegroundColor Red
     }
 }
+
 function Check-Version {
     try {
-        # Скачиваем raw-файл
         $remoteScript = Invoke-WebRequest -Uri $updateRepoUrl -TimeoutSec 5 -UseBasicParsing
         $remoteContent = $remoteScript.Content
-        # Ищем маркер версии в remote
         $remoteVersion = $null
         $lines = $remoteContent -split "`n"
         foreach ($line in $lines) {
@@ -131,66 +175,53 @@ function Check-Version {
                 break
             }
         }
-        # Получаем локальную версию
-        $scriptPath = Get-ScriptPath
-        $localVersion = Get-LocalVersion -Path $scriptPath
-
+        $scriptFile = Join-Path $scriptPath "NetworkReport.ps1"
+        $localVersion = Get-LocalVersion -Path $scriptFile
         if ($remoteVersion -ne $localVersion) {
             Write-Host " Доступна новая версия: $remoteVersion (текущая: $localVersion)." -ForegroundColor Yellow
-            }
         }
-            catch {
-                Write-Host ""
-                }
+    } catch {
+        # игнорируем ошибки сети
+    }
 }
 
 function Update-Script {
-    param([string]$RemoteContent, [string]$RemoteVersion)
+    param($RemoteContent, $RemoteVersion)
+    $repoUrl = "https://github.com/Yozmor/network-report/archive/refs/heads/main.zip"
+    $tempZip = Join-Path $env:TEMP "network-report-update.zip"
+    $tempExtract = Join-Path $env:TEMP "network-report-update"
 
-    $scriptPath = Get-ScriptPath
-    if (-not $scriptPath) {
-        Write-Host " Не удалось определить путь к текущему скрипту." -ForegroundColor Red
-        return
-    }
-
-    # Резервная копия
-    $backupDir = Split-Path $scriptPath -Parent
-    $backupFile = Join-Path $backupDir "NetworkReport_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').ps1"
+    Write-Host "`nСкачивание обновлений..." -ForegroundColor Cyan
     try {
-        Copy-Item -Path $scriptPath -Destination $backupFile -Force
-        Write-Host " Резервная копия сохранена: $backupFile" -ForegroundColor Gray
-    } catch {
-        Write-Host " Не удалось создать резервную копию." -ForegroundColor Red
-        return
-    }
-
-    # Запись новой версии
-    try {
-        $RemoteContent | Out-File -FilePath $scriptPath -Encoding utf8 -Force
-        Write-Host " Скрипт обновлён до версии $RemoteVersion. Перезапустите его для применения." -ForegroundColor Green
-        Write-Host "Нажмите Enter для выхода..."
-        Read-Host | Out-Null
+        # 1. Скачиваем архив репозитория
+        Invoke-WebRequest -Uri $repoUrl -OutFile $tempZip -UseBasicParsing -ErrorAction Stop
+        
+        # 2. Распаковываем архив
+        Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+        Expand-Archive -Path $tempZip -DestinationPath $tempExtract -Force
+        
+        # 3. Находим папку с содержимым (обычно network-report-main)
+        $sourceDir = Get-ChildItem $tempExtract -Directory | Select-Object -First 1
+        if (-not $sourceDir) { throw "Не найдена папка с обновлениями" }
+        
+        # 4. Копируем обновления в папку со скриптом
+        Write-Host "Копирование обновлённых файлов..." -ForegroundColor Gray
+        Copy-Item -Path "$($sourceDir.FullName)\*" -Destination $scriptPath -Recurse -Force
+        
+        Write-Host "Обновление завершено. Перезапустите программу." -ForegroundColor Green
+        Read-Host "Нажмите Enter для выхода"
         exit
     } catch {
-        Write-Host " Не удалось записать обновление. Попробуйте запустить PowerShell от администратора." -ForegroundColor Red
+        Write-Host "Ошибка обновления: $_" -ForegroundColor Red
+    } finally {
+        # 5. Удаляем временные файлы
+        Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
+        Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
-# =============== ОЧИСТКА СТАРЫХ ЛОГОВ ===============
-function Remove-OldLogs {
-    $cutoffDate = (Get-Date).AddDays(-$config.MaxLogAgeDays)
-    $oldFiles = Get-ChildItem $baseLogFolder -Recurse -File | Where-Object {
-        $_.LastWriteTime -lt $cutoffDate
-    }
-    if ($oldFiles) {
-        $oldFiles | Remove-Item -Force
-        Write-Host "Очищено $($oldFiles.Count) старых логов (старше $DaysOld дней)." -ForegroundColor Gray
-    }
-}
 
-# =============== НАСТРОЙКИ ЛОГИРОВАНИЯ ===============
-$baseLogFolder = Join-Path $PSScriptRoot "Logs"
-$maxLogAgeDays = 180  # полгода
+
 
 # Функция получения пути к логу с учётом типа подключения
 function Get-LogFilePath {
@@ -209,8 +240,7 @@ function Get-LogFilePath {
     return Join-Path $targetFolder $fileName
 }
 
-# При запуске чистим старые логи
-Remove-OldLogs -DaysOld $maxLogAgeDays
+
 
 
 # =============== ДЕТАЛЬНОЕ ОПРЕДЕЛЕНИЕ ТИПА ПОДКЛЮЧЕНИЯ ===============
@@ -313,15 +343,17 @@ $dnsTargets = @()  # Загрузится из файла
 # ==============================================
 
 # =============== ЗАГРУЗКА СПИСКОВ ИЗ ФАЙЛОВ ===============
-$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Load-ItemList {
     param($FileName, $DefaultItems = @(), $HeaderComment = "# Список целей`n# Формат: значение;комментарий")
+    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+        Write-Host "Не удалось определить путь к скрипту. Загрузка $FileName невозможна." -ForegroundColor Red
+        return $DefaultItems
+    }
     $path = Join-Path $scriptPath $FileName
     if (-not (Test-Path $path)) {
         $HeaderComment | Out-File $path -Encoding UTF8
         Write-Host "Создан $FileName. Добавьте данные и перезапустите." -ForegroundColor Yellow
-        Write-Host "Файл '$FileName' пуст)." -ForegroundColor Yellow 
         return $DefaultItems
     }
     $fileSize = (Get-Item $path).Length
@@ -366,11 +398,11 @@ function Write-Log {
 # --- Автоматическая установка NextTrace в папку скрипта ---
 function Initialize-NextTrace {
     # Используем глобальную переменную scriptPath (определена в основном скрипте)
-    if (-not $global:scriptPath) {
+    if (-not $scriptPath) {
         Write-Host " Ошибка: глобальная переменная scriptPath не определена." -ForegroundColor Red
         return $null
     }
-    $toolsDir = Join-Path $global:scriptPath "Tools"
+    $toolsDir = Join-Path $scriptPath "Tools"
     $nexttracePath = Join-Path $toolsDir "nexttrace.exe"
 
     if (Test-Path $nexttracePath) {
@@ -410,6 +442,30 @@ function Initialize-NextTrace {
 
     Write-Host " Установка NextTrace завершена." -ForegroundColor Green
     return $nexttracePath
+}
+# --- Автоматическая установка LibreSpeed CLI ---
+function Ensure-LibreSpeed {
+    $toolsDir = Join-Path $scriptPath "Tools"
+    $librespeedPath = Join-Path $toolsDir "librespeed-cli.exe"
+    if (Test-Path $librespeedPath) {
+        return $librespeedPath
+    }
+    Write-Host " Установка LibreSpeed CLI..." -ForegroundColor Yellow
+    if (-not (Test-Path $toolsDir)) {
+        New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
+    }
+    $downloadUrl = "https://github.com/librespeed/speedtest-cli/releases/download/v1.0.11/librespeed-cli_1.0.11_windows_amd64.zip"
+    $zipPath = Join-Path $toolsDir "librespeed-cli.zip"
+    try {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
+        Expand-Archive -Path $zipPath -DestinationPath $toolsDir -Force
+        Remove-Item $zipPath -Force
+        Write-Host " LibreSpeed CLI установлен" -ForegroundColor Green
+    } catch {
+        Write-Host " Ошибка установки LibreSpeed CLI: $_" -ForegroundColor Red
+        return $null
+    }
+    return $librespeedPath
 }
 
 # --- ПРОВЕРКА ПОРТОВ (TCPING) ---
@@ -705,11 +761,15 @@ function Invoke-WebCheck {
         return $false
     }
     Write-Log "--- ДОСТУПНОСТЬ САЙТОВ ---" -Color Green -LogFile $LogFile
+
+    $timeout = if ($config.HttpTimeout -and $config.HttpTimeout -gt 0) { $config.HttpTimeout } else { 5 }
+
     foreach ($item in $sites) {
         $site = if ($item -is [string]) { $item } else { $item.Value }
         $url = if ($site.StartsWith("http")) { $site } else { "https://$site" }
         $start = Get-Date
-        $httpCode = curl.exe -L -k -I -s -o nul -w "%{http_code}" $url --connect-timeout $config.HttpTimeout 2>$null
+        $output = curl.exe -L -k -I -s -o nul -w "%{http_code}" $url --connect-timeout $timeout 2>&1
+        $httpCode = $output -join "`n"
         $ms = [math]::Round(((Get-Date) - $start).TotalMilliseconds, 0)
 
         if ($LASTEXITCODE -eq 0 -and $httpCode -match '^\d{3}$') {
@@ -720,7 +780,8 @@ function Invoke-WebCheck {
                 Write-Log "[?] $site - конечный код $code ($ms мс)" -Color Red -LogFile $LogFile
             }
         } else {
-            Write-Log "[FAIL] $site - нет ответа 5 сек" -Color Red -LogFile $LogFile
+            $errMsg = if ($output -match 'curl:.*') { $matches[0] } else { "нет ответа" }
+            Write-Log "[FAIL] $site - $errMsg ($ms мс)" -Color Red -LogFile $LogFile
         }
     }
     return $true
@@ -817,29 +878,29 @@ function Invoke-WebAndDnsDiagnostics {
         $httpTime = $null
         $url = if ($domain.StartsWith("http")) { $domain } else { "https://$domain" }
         $start = Get-Date
-        try {
-            $response = curl.exe -L -k -I -s -o nul -w "%{http_code}" $url --connect-timeout $config.HttpTimeout 2>$null
-            $ms = [math]::Round(((Get-Date) - $start).TotalMilliseconds, 0)
-            if ($LASTEXITCODE -eq 0 -and $response -match '^\d{3}$') {
-                $code = [int]$response
-                if ($code -ge 200 -and $code -lt 400) {
+
+        $timeout = if ($config.HttpTimeout -and $config.HttpTimeout -gt 0) { $config.HttpTimeout } else { 5 }
+        $response = curl.exe -L -k -I -s -o nul -w "%{http_code}" $url --connect-timeout $timeout 2>&1
+        $ms = [math]::Round(((Get-Date) - $start).TotalMilliseconds, 0)
+
+        if ($LASTEXITCODE -eq 0 -and $response -match '^\d{3}$') {
+            $code = [int]$response
+            if ($code -ge 200 -and $code -lt 400) {
                 $httpStatus = " Доступен"
                 $httpTime = $ms
             } else {
-                $httpStatus = " Код $($code)"
+                $httpStatus = " Код $code"
                 $httpTime = $ms
             }
         } else {
             $httpStatus = " Ошибка"
             $httpTime = $null
         }
-        }
-         catch { }
 
         # ----- Собираем ответы от всех DNS -----
         $dnsResults = @()
         $anyMismatch = $false
-        $referenceIp = $null  # эталонный IP для сравнения
+        $referenceIp = $null
 
         foreach ($dns in $allDnsServers) {
             $ip = "нет ответа"
@@ -858,12 +919,9 @@ function Invoke-WebAndDnsDiagnostics {
                 Time    = $time
             }
 
-            # Определяем эталонный IP: первый успешный ответ среди всех DNS
             if ($ip -ne "нет ответа" -and $null -eq $referenceIp) {
                 $referenceIp = $ip
             }
-
-            # Если уже есть эталон и текущий IP отличается (и не ошибка) — расхождение
             if ($referenceIp -and $ip -ne "нет ответа" -and $ip -ne $referenceIp) {
                 $anyMismatch = $true
             }
@@ -897,13 +955,11 @@ function Invoke-WebAndDnsDiagnostics {
         Write-Log "" -Color $TitleColor -LogFile $LogFile
         Write-Log "$Title ($($Sites.Count)):" -Color $TitleColor -LogFile $LogFile
 
-        # --- Ширина колонок ---
         $domainWidth = ($Sites | ForEach-Object { $_.Domain.Length } | Measure-Object -Maximum).Maximum
         $domainWidth = [math]::Max($domainWidth, 4) + 2
         $httpWidth = 16
-        $dnsColWidth = 27   # примерно "8.8.8.8: 149.154.167.99 (12ms)"
+        $dnsColWidth = 27
 
-        # --- Заголовок ---
         $header = "Сайт".PadRight($domainWidth) + " │ " + "Доступность".PadRight($httpWidth)
         foreach ($dns in $allDnsServers) {
             $hostAddr = if ($null -ne $dns.Host) { $dns.Host } elseif ($null -ne $dns.Value) { $dns.Value } else { "?" }
@@ -916,14 +972,12 @@ function Invoke-WebAndDnsDiagnostics {
         }
         Write-Log $header -Color Cyan -LogFile $LogFile
 
-        # --- Разделитель ---
         $separator = "".PadRight($domainWidth, '─') + "─┼─" + "".PadRight($httpWidth, '─')
         foreach ($dns in $allDnsServers) {
             $separator += "─┼─" + "".PadRight($dnsColWidth, '─')
         }
         Write-Log $separator -Color Gray -LogFile $LogFile
 
-        # --- Строки сайтов ---
         foreach ($s in $Sites) {
             $line = $s.Domain.PadRight($domainWidth) + " │ " + $s.HttpStatus.PadRight($httpWidth)
             foreach ($dnsResult in $s.DnsResults) {
@@ -1045,30 +1099,7 @@ function Analyze-Trace {
     }
     return $true
 }
-# --- Автоматическая установка LibreSpeed CLI ---
-function Ensure-LibreSpeed {
-    $toolsDir = Join-Path $scriptPath "Tools"
-    $librespeedPath = Join-Path $toolsDir "librespeed-cli.exe"
-    if (Test-Path $librespeedPath) {
-        return $librespeedPath
-    }
-    Write-Host " Установка LibreSpeed CLI..." -ForegroundColor Yellow
-    if (-not (Test-Path $toolsDir)) {
-        New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
-    }
-    $downloadUrl = "https://github.com/librespeed/speedtest-cli/releases/download/v1.0.11/librespeed-cli_1.0.11_windows_amd64.zip"
-    $zipPath = Join-Path $toolsDir "librespeed-cli.zip"
-    try {
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
-        Expand-Archive -Path $zipPath -DestinationPath $toolsDir -Force
-        Remove-Item $zipPath -Force
-        Write-Host " LibreSpeed CLI установлен" -ForegroundColor Green
-    } catch {
-        Write-Host " Ошибка установки LibreSpeed CLI: $_" -ForegroundColor Red
-        return $null
-    }
-    return $librespeedPath
-}
+
 function Invoke-SpeedTest {
     param($LogFile)
 
@@ -1184,10 +1215,11 @@ function Show-Menu-Settings {
     Write-Host "1 - Показать текущие настройки" -ForegroundColor Yellow
     Write-Host "2 - Изменить таймаут соединения (сейчас $($config.ConnectionTimeout) мс)" -ForegroundColor Yellow
     Write-Host "3 - Изменить таймаут чтения баннера (сейчас $($config.BannerTimeout) мс)" -ForegroundColor Yellow
-    Write-Host "4 - Изменить период хранения логов (сейчас $($config.MaxLogAgeDays) дней)" -ForegroundColor Yellow
-    Write-Host "5 - Сбросить настройки по умолчанию" -ForegroundColor Yellow
-    Write-Host "6 - Инструкция" -ForegroundColor Yellow
-    Write-Host "7 - Проверить обновления" -ForegroundColor Yellow
+    Write-Host "4 - Изменить таймаут для http запросов (сейчас $($config.HttpTimeout) мс)" -ForegroundColor Yellow
+    Write-Host "5 - Изменить период хранения логов (сейчас $($config.MaxLogAgeDays) дней)" -ForegroundColor Yellow
+    Write-Host "6 - Сбросить настройки по умолчанию" -ForegroundColor Yellow
+    Write-Host "7 - Инструкция" -ForegroundColor Yellow
+    Write-Host "8 - Проверить обновления" -ForegroundColor Yellow
     Write-Host "0 - Назад" -ForegroundColor Yellow
 }
 do {
@@ -1342,6 +1374,7 @@ do {
                         Write-Host ""
                         Write-Host "ConnectionTimeout: $($config.ConnectionTimeout) мс — таймаут установки TCP-соединения при сканировании портов." -ForegroundColor White
                         Write-Host "BannerTimeout: $($config.BannerTimeout) мс — таймаут ожидания баннера (приветствия) после подключения." -ForegroundColor White
+                        Write-Host "HttpTimeout: $($config.HttpTimeout) мс — таймаут для http запроса." -ForegroundColor White
                         Write-Host "MaxLogAgeDays: $($config.MaxLogAgeDays) дней — срок хранения логов (старше удаляются)." -ForegroundColor White
                         Write-Host ""
                         Write-Host "Нажмите Enter для продолжения..." -ForegroundColor Gray
@@ -1362,6 +1395,13 @@ do {
                         } else { Write-Host "Неверный ввод" -ForegroundColor Red }
                     }
                     "4" {
+                        $newValue = Read-Host "Введите новый таймаут для http (мс, текущий $($config.HttpTimeout))"
+                        if ($newValue -match '^\d+$') {
+                            $config.HttpTimeout = [int]$newValue
+                            Save-Config
+                        } else { Write-Host "Неверный ввод" -ForegroundColor Red }
+                    }
+                    "5" {
                         $newValue = Read-Host "Введите период хранения логов в днях (текущий $($config.MaxLogAgeDays))"
                         if ($newValue -match '^\d+$') {
                             $config.MaxLogAgeDays = [int]$newValue
@@ -1369,10 +1409,11 @@ do {
                             Save-Config
                         } else { Write-Host "Неверный ввод" -ForegroundColor Red }
                     }
-                    "5" {
+                    "6" {
                         $config = @{
                             ConnectionTimeout = 500
                             BannerTimeout = 2000
+                            HttpTimeout = 5
                             MaxLogAgeDays = 180
                         }
                         Save-Config
@@ -1381,126 +1422,128 @@ do {
                         $maxLogAgeDays = $config.MaxLogAgeDays
                         Write-Host "Настройки сброшены к значениям по умолчанию." -ForegroundColor Green
                     }
-                    "6" {
+"7" {
     Write-Host ""
     Write-Host "╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
     Write-Host "║                      ИНСТРУКЦИЯ ПО СКРИПТУ                       ║" -ForegroundColor Cyan
     Write-Host "╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "1. ФАЙЛЫ НАСТРОЕК (лежат в папке со скриптом, создаются при первом запуске):"
+    Write-Host "1. ФАЙЛЫ НАСТРОЕК (создаются автоматически, редактируйте Блокнотом):"
     Write-Host "   ----------------------------------------------------------------"
-    Write-Host "   📄 sites.txt           — список сайтов для проверки доступности."
-    Write-Host "                           Каждый сайт с новой строки."
-    Write-Host "                           Пример: t.me, discord.com, youtube.com"
+    Write-Host "    sites.txt           – список сайтов (по одному на строку)."
+    Write-Host "                           Пример: t.me, google.com, youtube.com"
     Write-Host ""
-    Write-Host "   📄 trace_targets.txt   — цели для трассировки (IP или домены)."
-    Write-Host "                           Формат: значение;комментарий"
+    Write-Host "    trace_targets.txt   – цели для TCP-трассировки."
+    Write-Host "                           Формат: IP/домен;комментарий"
     Write-Host "                           Пример: 94.131.109.144;Франкфурт"
     Write-Host ""
-    Write-Host "   📄 scan_targets.txt    — цели для сканирования портов (IP или домены)."
-    Write-Host "                           Формат: значение;комментарий"
+    Write-Host "    scan_targets.txt    – цели для сканирования портов."
+    Write-Host "                           Формат: IP;комментарий"
     Write-Host "                           Пример: 212.41.7.181;Питер"
     Write-Host ""
-    Write-Host "   📄 dns_targets.txt     — DNS-серверы для сравнения в полной диагностике."
+    Write-Host "    dns_targets.txt     – DNS-серверы для сравнения."
     Write-Host "                           Формат: IP;комментарий"
     Write-Host "                           Пример: 8.8.8.8;Google Public DNS"
     Write-Host ""
-    Write-Host "   💡 Все файлы можно редактировать Блокнотом. Строки, начинающиеся с #,"
-    Write-Host "      игнорируются (можно оставлять комментарии)."
+    Write-Host "    config.json         – настройки программы (редактируйте через меню 5)."
     Write-Host ""
-    Write-Host "2. ЛОГИ (сохраняются в папку Logs рядом со скриптом):"
+    Write-Host "2. ЛОГИ (сохраняются в папку Logs):"
     Write-Host "   ----------------------------------------------------------------"
-    Write-Host "   📁 Logs/"
+    Write-Host "    Logs/"
     Write-Host "      └─── [Тип подключения]_[Детали]+[VPN]/"
     Write-Host "           └─── [тип проверки]/"
     Write-Host "                └───ГГГГ-ММ-ДД_ЧЧММСС.txt"
     Write-Host ""
-    Write-Host "   🔹 Тип подключения: Wi-Fi / Модем / Проводное"
-    Write-Host "   🔹 Детали: для Wi-Fi — имя сети (SSID), для остальных — имя адаптера."
-    Write-Host "   🔹 VPN: добавляется суффикс +VPN_Имя, если активен VPN."
-    Write-Host "   🔹 Типы проверок: http, dns_full, trace, service_scan, speedtest"
-    Write-Host ""
+    Write-Host "   Типы проверок: http, dns_full, trace, service_scan, speedtest"
     Write-Host "   Пример: Logs\Wi-Fi_Stonehenge+VPN_AmneziaVPN\trace\2026-04-11_195624.txt"
     Write-Host ""
     Write-Host "3. ГЛАВНОЕ МЕНЮ:"
     Write-Host "   ----------------------------------------------------------------"
-    Write-Host "   1 — Проверить доступность сайтов (подменю: HTTP / полная диагностика / свой хост)"
-    Write-Host "   2 — Трассировка (подменю: из списка / свой хост)"
-    Write-Host "   3 — Сканирование портов (подменю: из списка / свой хост)"
-    Write-Host "   4 — Проверить скорость интернета (LibreSpeed)"
-    Write-Host "   5 — Настройки (инструкция, изменение таймаутов, обновления)"
-    Write-Host "   0 — Выход"
+    Write-Host "   1 – Доступность сайтов"
+    Write-Host "   2 – Трассировка"
+    Write-Host "   3 – Сканирование портов"
+    Write-Host "   4 – Проверка скорости интернета"
+    Write-Host "   5 – Настройки (изменение таймаутов, инструкция, обновления)"
+    Write-Host "   0 – Выход"
     Write-Host ""
     Write-Host "4. ПОДРОБНОЕ ОПИСАНИЕ ПУНКТОВ:"
     Write-Host "   ----------------------------------------------------------------"
     Write-Host ""
-    Write-Host "   📍 1 → Доступность сайтов:"
+    Write-Host "    1 → Доступность сайтов (подменю):"
     Write-Host "       1.1  Проверить сайты (только HTTP)"
-    Write-Host "            • Проверяет доступность сайтов из sites.txt методом HEAD."
-    Write-Host "            • Результат: [OK] время ответа, [?] код ответа (редирект, ошибка), [FAIL] нет ответа."
+    Write-Host "            • Выполняет HEAD-запрос к каждому сайту через curl."
+    Write-Host "            • Вывод: [OK] – доступен (время ответа в мс),"
+    Write-Host "                     [?] – код ответа (редирект, ошибка),"
+    Write-Host "                     [FAIL] – нет ответа за таймаут (настраивается)."
+    Write-Host "                     Коды HTTP: 200 – OK, 301/302 – редирект, 403 – запрещено, 404 – не найдено."
+    Write-Host "            • Настройка: таймаут HTTP-запроса (меню 5 → 4)."
+    Write-Host ""
     Write-Host "       1.2  Полная диагностика (HTTP + DNS)"
-    Write-Host "            • Для каждого сайта: HTTP-доступность + разрешение через системный DNS"
-    Write-Host "              и все DNS из dns_targets.txt. Выводится таблица с IP и временем ответа,"
-    Write-Host "              отмечается возможная подмена DNS (!!!)."
+    Write-Host "            • Для каждого сайта: HTTP-доступность + разрешение имени через системный DNS"
+    Write-Host "              и все DNS из dns_targets.txt."
+    Write-Host "            • Выводится таблица: сайт, HTTP-статус, для каждого DNS – IP и время ответа."
+    Write-Host "            • При расхождении IP между разными DNS добавляется пометка !!!."
+    Write-Host "            • Настройка: те же таймауты HTTP и DNS (см. выше)."
+    Write-Host ""
     Write-Host "       1.3  Полная диагностика (свой хост)"
     Write-Host "            • То же, что 1.2, но для одного введённого вручную домена/IP."
     Write-Host ""
-    Write-Host "   📍 2 → Трассировка (TCP, утилита nexttrace):"
+    Write-Host "    2 → Трассировка (TCP, утилита nexttrace):"
     Write-Host "       2.1  Трассировка (из списка)"
-    Write-Host "            • Выполняет TCP-трассировку до каждой цели из trace_targets.txt."
-    Write-Host "            • Отображает хопы, три времени отклика, IP, географию и провайдера."
-    Write-Host "            • Требует прав администратора для работы (использует WinDivert)."
+    Write-Host "            • Выполняет TCP-трассировку до каждой цели из trace_targets.txt (порт 22)."
+    Write-Host "            • Отображает таблицу: хоп, IP, три времени отклика (мс), геолокация/провайдер."
+    Write-Host "            • Звёздочка (*) – пакет потерян или узел не отвечает."
+    Write-Host "            • Для работы требуются права администратора (драйверы WinDivert/Npcap)."
+    Write-Host "            • Настройки: максимальное число хопов и таймаут пинга (в меню 5, но в текущей версии не выставлены; можно изменить в config.json)."
+    Write-Host ""
     Write-Host "       2.2  Трассировка (свой хост)"
     Write-Host "            • То же, но для одного IP/домена, введённого вручную."
     Write-Host ""
-    Write-Host "   📍 3 → Сканирование портов:"
-    Write-Host "       • Сканирует предопределённый список портов (21,22,23,25,53,80,110,111,135,139,143,"
-    Write-Host "         443,445,993,995,1723,3306,3389,5432,5900,6379,8080,8443,25565,27017,27018)."
-    Write-Host "       • Определяет открытые порты, пытается получить баннер, распознаёт сервис и версию."
-    Write-Host "       • Определяет ОС по баннеру (Ubuntu, Debian, Windows и т.п.)."
-    Write-Host "       • Проверяет найденные версии на известные уязвимости (локальная база CVE)."
-    Write-Host "       • Выводит для каждой цели: открытые порты с сервисами, закрытые порты, найденные уязвимости."
+    Write-Host "    3 → Сканирование портов (TCP):"
+    Write-Host "       3.1  Сканирование (из списка)"
+    Write-Host "            • Проверяет список портов на всех IP из scan_targets.txt."
+    Write-Host "            • Выводит: операционную систему (если удалось определить), количество открытых портов,"
+    Write-Host "              для каждого порта – статус (ОТКРЫТ/ЗАКРЫТ) и имя сервиса."
+    Write-Host "            • Для открытых портов с версией проверяет уязвимости по локальной базе CVE."
+    Write-Host "            • Настройки: таймаут соединения и таймаут баннера (меню 5 → 2,3)."
     Write-Host ""
-    Write-Host "   📍 4 → Проверить скорость интернета:"
-    Write-Host "       • Использует утилиту librespeed-cli (автоматически загружается при первом запуске)."
-    Write-Host "       • Измеряет пинг, скорость загрузки и отдачи в Mbit/s."
-    Write-Host "       • В РФ для стабильной работы рекомендуется использовать VPN."
+    Write-Host "       3.2  Сканирование (свой хост)"
+    Write-Host "            • То же, но для одного IP/домена."
     Write-Host ""
-    Write-Host "   📍 5 → Настройки:"
+    Write-Host "    4 → Проверка скорости интернета (LibreSpeed):"
+    Write-Host "            • Использует утилиту librespeed-cli (автоматически скачивается в папку Tools)."
+    Write-Host "            • Выводит: выбранный сервер (город, провайдер), пинг (ms), скорость загрузки и отдачи (Mbit/s)."
+    Write-Host "            • Пример вывода:"
+    Write-Host "                Сервер:      Frankfurt, Germany (Clouvider)"
+    Write-Host "                Пинг:          111,55 ms"
+    Write-Host "                Загрузка:       57,52 Mbit/s"
+    Write-Host "                Отдача:         69,23 Mbit/s"
+    Write-Host "            • В РФ для стабильной работы рекомендуется использовать VPN."
+    Write-Host "            • Настройки: количество повторных попыток (в config.json)."
+    Write-Host ""
+    Write-Host "    5 → Настройки:"
     Write-Host "       5.1  Показать текущие настройки (таймауты, срок хранения логов)."
-    Write-Host "       5.2  Изменить таймаут TCP-соединения при сканировании портов."
-    Write-Host "       5.3  Изменить таймаут ожидания баннера."
-    Write-Host "       5.4  Изменить период хранения логов (дни)."
-    Write-Host "       5.5  Сбросить настройки по умолчанию."
-    Write-Host "       5.6  Инструкция (этот текст)."
-    Write-Host "       5.7  Проверить обновления (сравнивает версию с GitHub)."
+    Write-Host "       5.2  Изменить таймаут TCP-соединения (ConnectionTimeout) – влияет на сканирование портов."
+    Write-Host "       5.3  Изменить таймаут баннера (BannerTimeout) – ожидание приветствия после подключения."
+    Write-Host "       5.4  Изменить таймаут HTTP-запроса (HttpTimeout) – для проверки сайтов."
+    Write-Host "       5.5  Изменить период хранения логов (MaxLogAgeDays) – логи старше удаляются при запуске."
+    Write-Host "       5.6  Сбросить настройки по умолчанию."
+    Write-Host "       5.7  Инструкция (этот текст)."
+    Write-Host "       5.8  Проверить обновления – сравнивает версию с GitHub и предлагает обновить весь скрипт."
     Write-Host ""
-    Write-Host "5. КАК ПОНИМАТЬ РЕЗУЛЬТАТЫ:"
-    Write-Host "   ----------------------------------------------------------------"
-    Write-Host "   📍 Коды HTTP: 200 — OK, 301/302 — редирект, 403 — запрещено, 404 — не найдено."
-    Write-Host "   📍 Трассировка (nexttrace):"
-    Write-Host "       • Time1/Time2/Time3 — три попытки измерения времени до хопа (в мс)."
-    Write-Host "       • Звёздочка (*) — пакет потерян или узел не отвечает."
-    Write-Host "       • [local] — локальный IP (частные диапазоны)."
-    Write-Host "       • Location / Provider — страна, город, интернет-провайдер (если определено)."
-    Write-Host "   📍 Сканирование портов:"
-    Write-Host "       • ОТКРЫТ — порт доступен, сервис определён (или известный порт)."
-    Write-Host "       • ЗАКРЫТ — порт не отвечает за таймаут."
-    Write-Host "       • Уязвимости: выводятся CVE и краткое описание, если версия сервиса совпадает с шаблоном."
-    Write-Host ""
-    Write-Host "6. ПРИМЕЧАНИЯ:"
+    Write-Host "5. ПРИМЕЧАНИЯ:"
     Write-Host "   ----------------------------------------------------------------"
     Write-Host "   • При первом запуске создаются пустые файлы настроек. Заполните их данными."
-    Write-Host "   • Отчёты автоматически сортируются по типу подключения и VPN."
-    Write-Host "   • Логи старше заданного в настройках количества дней автоматически удаляются."
-    Write-Host "   • Версия скрипта проверяется при каждом запуске; обновление — в пункте 5.7."
-    Write-Host "   • TCP-трассировка (nexttrace) требует прав администратора и драйверов (WinDivert/Npcap)."
+    Write-Host "   • Отчёты автоматически сортируются по типу подключения и активному VPN."
+    Write-Host "   • Логи старше заданного количества дней удаляются автоматически."
+    Write-Host "   • TCP-трассировка требует прав администратора (для драйверов WinDivert/Npcap)."
+    Write-Host "   • Для работы speedtest необходима утилита librespeed-cli (скачивается автоматически)."
     Write-Host ""
     Write-Host "Нажмите Enter, чтобы вернуться в меню..." -ForegroundColor Gray
     Read-Host | Out-Null
 }
         
-        "7" {
+        "8" {
             Check-ForUpdates
         }
         "0" {}

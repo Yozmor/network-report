@@ -1,5 +1,0 @@
-{
-  "ConnectionTimeout": 200,
-  "BannerTimeout": 2000,
-  "MaxLogAgeDays": 180
-}

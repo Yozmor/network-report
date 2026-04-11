@@ -1,5 +1,5 @@
 # NetworkReport.ps1 - pure ASCII, no Unicode, no WHOIS, fast tracert
-$scriptVersion = "4.0"
+$scriptVersion = "4.1"
 
 # =============== БЕЗОПАСНОЕ ОПРЕДЕЛЕНИЕ ПУТИ К СКРИПТУ ===============
 $scriptPath = $null
@@ -35,12 +35,9 @@ function Load-Config {
         $config = Get-Content $configPath -Raw | ConvertFrom-Json
         # Добавляем недостающие поля
         $defaults = @{
-            MaxHops = 30
-            PingTimeout = 500
             ConnectionTimeout = 500
             BannerTimeout = 2000
             HttpTimeout = 5
-            SpeedtestRetries = 2
             MaxLogAgeDays = 180
         }
         foreach ($key in $defaults.Keys) {
@@ -50,12 +47,9 @@ function Load-Config {
         }
     } else {
         $config = @{
-            MaxHops = 30
-            PingTimeout = 500
             ConnectionTimeout = 500
             BannerTimeout = 2000
             HttpTimeout = 5
-            SpeedtestRetries = 2
             MaxLogAgeDays = 180
         }
         Save-Config $config
@@ -102,16 +96,18 @@ $updateRepoUrl = "https://raw.githubusercontent.com/Yozmor/network-report/refs/h
 
 function Get-LocalVersion {
     param([string]$Path)
-    if (-not $Path -or -not (Test-Path $Path)) { return "0.0" }
+    if (-not $Path -or -not (Test-Path $Path)) { 
+        return $scriptVersion   # возвращаем текущую версию, если файл не найден
+    }
     $content = Get-Content $Path -Raw -ErrorAction SilentlyContinue
-    if (-not $content) { return "0.0" }
+    if (-not $content) { return $scriptVersion }
     if ($content -match '#\s*VERSION\s*=\s*([\d\.]+)') {
         return $matches[1]
     }
     if ($content -match '\$scriptVersion\s*=\s*"([\d\.]+)"') {
         return $matches[1]
     }
-    return "0.0"
+    return $scriptVersion
 }
 
 function Check-ForUpdates {
@@ -519,7 +515,7 @@ function Invoke-ServiceScan {
         6379 = "Redis"
         8080 = "HTTP-Alt"
         8443 = "HTTPS-Alt"
-        25565 = "Minecrafte"
+        25565= "Minecraft"
         27017= "MongoDB"
         27018= "MongoDB"
     }
@@ -1338,8 +1334,8 @@ do {
                             $custom = Read-Host "Введите IP или домен"
                             if ($custom) {
                                 $logFile = Start-Report -FolderKey "service_scan"
-                                $scanTargets = [PSCustomObject]@{ IP = $custom; Comment = "" }
-                                $success = Invoke-ServiceScan -LogFile $logFile -Targets $scanTargets
+                                $tempTargets = [PSCustomObject]@{ IP = $custom; Comment = "" }
+                                $success = Invoke-ServiceScan -LogFile $logFile -Targets $tempTargets
                             }
                     }    
                     "0" {}

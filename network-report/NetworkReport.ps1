@@ -1,5 +1,5 @@
 # NetworkReport.ps1 - pure ASCII, no Unicode, no WHOIS, fast tracert
-$scriptVersion = "4.1"
+$scriptVersion = "4.2"
 
 # =============== БЕЗОПАСНОЕ ОПРЕДЕЛЕНИЕ ПУТИ К СКРИПТУ ===============
 $scriptPath = $null
